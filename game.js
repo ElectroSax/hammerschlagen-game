@@ -515,7 +515,7 @@ function applyTurnAction(room, playerId, action, random, swingPosition, allowNpc
     if (player.drunk <= 0) {
       return { ok: false, error: "You are not intoxicated." };
     }
-    player.drunk -= 1;
+    player.drunk -= round(player.constitution/2);
     if (match.suddenDeathActive) match.suddenDeathRound[playerId] = false;
     if (allowNpc) {
       match.lastSwing = null;

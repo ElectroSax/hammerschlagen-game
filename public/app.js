@@ -123,7 +123,7 @@
       criticalWidth: isSuddenDeath ? 0 : isBent ? 2 : Math.min(7, 2 + player.strength * 0.25),
       bendWidth: (100 - width) * (0.25 + 0.5 * player.dexterity / 5) / 2,
       wisdomSlowdown: player.wisdom * 0.12,
-      speed: Math.min(450, speedAtZeroDexterity * 0.7 / dexterityFactor)
+      speed: Math.min(450, speedAtZeroDexterity * 0.75 / dexterityFactor)
     };
   }
 
@@ -731,7 +731,7 @@
                      ? '<button id="drink-beer" class="button button-primary">Drink a Beer · roll d20</button>'
                      : isSuddenDeathDrinkRequired
                      ? '<button id="drink-beer" class="button button-primary">Drink a Beer before swinging · roll d20</button>'
-                     : isWaitingForConfirm ? "" : `<button id="swing" class="button button-primary" ${currentBeerRoll?.rolling ? "disabled" : ""}>${isManualNpcTurn ? "Swing for NPC" : "Swing"} <span class="key">SPACE BAR</span></button>${myBent ? `<button id="${isManualNpcTurn ? "host-straighten-npc" : "straighten"}" class="button button-secondary" ${currentBeerRoll?.rolling ? "disabled" : ""}>Straighten nail · uses turn</button>` : ""}${shownDrunk && !match.suddenDeathActive ? `<button id="${isManualNpcTurn ? "host-sober-up-npc" : "sober-up"}" class="button button-secondary" ${currentBeerRoll?.rolling ? "disabled" : ""}>Sober Up · uses turn</button>` : ""}`}
+                     : isWaitingForConfirm ? "" : `<button id="swing" class="button button-primary" ${currentBeerRoll?.rolling ? "disabled" : ""}>${isManualNpcTurn ? "Swing for NPC" : "Swing"} <span class="key">SPACE BAR</span></button>${myBent ? `<button id="${isManualNpcTurn ? "host-straighten-npc" : "straighten"}" class="button button-secondary" ${currentBeerRoll?.rolling ? "disabled" : ""}>Straighten nail · uses turn</button>` : ""}${shownDrunk && !match.suddenDeathActive ? `<button id="${isManualNpcTurn ? "host-sober-up-npc" : "sober-up"}" class="button button-secondary" ${currentBeerRoll?.rolling ? "disabled" : ""}>Sober Up (Intoxicated - CON/2) · uses turn</button>` : ""}`}
                  </div>` : ""}
                  ${isMyTurn && !isWaitingForConfirm && !isPendingDrink && !isSuddenDeathDrinkRequired
                    ? '<p id="turn-timer" class="turn-timer" role="timer" aria-live="off">Swing automatically in 20s</p>' : ""}
@@ -812,7 +812,7 @@
     return `<section class="practice-game" aria-label="Solo swing practice">
       <h3>Solo swing practice</h3>
       <p class="help">Practice unlimited swings with random Strength, Dexterity, and Wisdom. Strength increases the Hit Zone, Dexterity lowers the speed of the hammer bar, Constitution improves your chances to resist becoming drunk, and Wisdom slows the hammer bar in the hit zone.</p>
-      <p class="help">Landing a hit in the very center grants a critical hit, giving you 2 hits. When the nail is bent, it increases the difficulty of hitting it next round. You may spend a turn to straighten the nail, which makes your next hit far easier. Missing the nail entirely causes you to drink a beer, forcing you to roll a constitution save to prevent becoming drunk. Becoming drunk makes hits more difficult for the rest of the game.</p>
+      <p class="help">Landing a hit in the very center grants a critical hit, giving you 2 hits. When the nail is bent, it increases the difficulty of hitting it next round. You may spend a turn to straighten the nail, which makes your next hit far easier. Missing the nail entirely causes you to drink a beer, forcing you to roll a constitution save to prevent becoming intoxicated. Becoming intoxicated makes hits more difficult for the rest of the match. You can use your turn to sober up, reducing your intoxciation level by your CON/2.</p>
       <p class="practice-stats">Practice stats · STR ${practiceState.stats.strength} · DEX ${practiceState.stats.dexterity} · CON ${practiceState.constitution} · WIS ${practiceState.stats.wisdom}${practiceState.bent ? " · Nail bent" : ""}${practiceState.bonus ? " · Straightening bonus" : ""} · Beers ${practiceState.beers}${practiceState.drunk ? ` · Intoxicated x${practiceState.drunk}` : ""}</p>
       <div class="meter-scroll">
         <div class="target-label"><span>Miss</span><span>Bend</span><span>Hit zone</span><span>Bend</span><span>Miss</span></div>
