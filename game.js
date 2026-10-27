@@ -91,6 +91,8 @@ function createMatch(round, playerIds, roundIndex = 1, settings = {}) {
     suddenDeathActive: false,
     suddenDeathRound: {},
     suddenDeathBeerDrank: {},
+    originalStats: {},
+    statPenalties: {},
     swingCount: 0,
     turnIndex: 0
   };
@@ -155,6 +157,7 @@ function queueGrandFinal(room) {
 }
 
 function seedTournament(room) {
+  if (room.currentMatch) restoreMatchStats(room, room.currentMatch);
   const ids = room.players.map((player) => player.id);
   room.seedIds = [...ids];
   room.phase = "tournament";
@@ -254,6 +257,10 @@ function startNextMatch(room) {
   room.currentMatch.playerIds.forEach((id) => {
     const player = room.players.find((entry) => entry.id === id);
     player.beersDrank = 0;
+    room.currentMatch.originalStats[id] = Object.fromEntries(
+      ["strength", "dexterity", "wisdom"].map((stat) => [stat, player[stat]])
+    );
+    room.currentMatch.statPenalties[id] = { strength: 0, dexterity: 0, wisdom: 0 };
   });
   return true;
 }
@@ -288,6 +295,7 @@ function advanceTurn(match) {
 
 function finishMatch(room, winnerId) {
   const match = room.currentMatch;
+  restoreMatchStats(room, match);
   const loserId = match.playerIds.find((id) => id !== winnerId);
   const loser = room.players.find((player) => player.id === loserId);
   if (loser) loser.losses += 1;
@@ -349,6 +357,29 @@ function finishMatch(room, winnerId) {
   }
   room.currentMatch = null;
   prepareNextMatch(room);
+}
+
+function restoreMatchStats(room, match) {
+  if (!match?.originalStats) return;
+  for (const [playerId, stats] of Object.entries(match.originalStats)) {
+    const player = room.players.find((entry) => entry.id === playerId);
+    if (!player) continue;
+    for (const stat of ["strength", "dexterity", "wisdom"]) {
+      if (Number.isInteger(stats[stat])) player[stat] = stats[stat];
+    }
+  }
+}
+
+function lowerHighestSuddenDeathStat(match, player) {
+  const stats = match.originalStats[player.id];
+  const penalties = match.statPenalties[player.id];
+  if (!stats || !penalties) return;
+  const stat = ["strength", "dexterity", "wisdom"]
+    .filter((name) => player[name] > 0)
+    .sort((left, right) => player[right] - player[left])[0];
+  if (!stat) return;
+  player[stat] -= 1;
+  penalties[stat] += 1;
 }
 
 function awardGame(room, match, winnerId) {
@@ -478,6 +509,9 @@ function applyTurnAction(room, playerId, action, random, swingPosition, allowNpc
   }
 
   if (action === "sober-up") {
+    if (match.suddenDeathActive) {
+      return { ok: false, error: "You cannot sober up during sudden death." };
+    }
     if (player.drunk <= 0) {
       return { ok: false, error: "You are not intoxicated." };
     }
@@ -617,7 +651,7 @@ function applyNpcTurn(room, random = Math.random) {
   const choice = drankBeforeSwing
     ? 0
     : player.drunk > 0 || canStraighten ? random() : 1;
-  if (!drankBeforeSwing && player.drunk > 0) {
+  if (!drankBeforeSwing && player.drunk > 0 && !match.suddenDeathActive) {
     if (bent && !mustCatchUp) {
       if (choice >= 0.4 && choice < 0.9) {
         return applyNpcTurnAction(room, playerId, "straighten");
@@ -763,6 +797,10 @@ function confirmTurn(room, playerId, isHost = false) {
     } else {
       match.suddenDeathRound = {};
       match.suddenDeathBeerDrank = {};
+      for (const id of match.playerIds) {
+        const participant = room.players.find((entry) => entry.id === id);
+        if (participant?.drunk >= MAX_INTOXICATION) lowerHighestSuddenDeathStat(match, participant);
+      }
     }
   }
   return { ok: true };
@@ -794,6 +832,7 @@ function randomizeBracket(room, random = Math.random) {
 function restartCurrentMatch(room) {
   if (!room.currentMatch || room.phase !== "tournament") return false;
   const match = room.currentMatch;
+  restoreMatchStats(room, match);
   room.currentMatch = createMatch(match.round, [...match.playerIds], match.roundIndex, {
     hitsToWin: match.hitsToWin,
     bestOf: match.bestOf,
@@ -803,15 +842,24 @@ function restartCurrentMatch(room) {
     const player = room.players.find((entry) => entry.id === id);
     player.beersDrank = 0;
     player.drunk = 0;
+    room.currentMatch.originalStats[id] = Object.fromEntries(
+      ["strength", "dexterity", "wisdom"].map((stat) => [stat, player[stat]])
+    );
+    room.currentMatch.statPenalties[id] = { strength: 0, dexterity: 0, wisdom: 0 };
   });
   return true;
 }
 
 function publicState(room) {
+  const visibleMatch = room.currentMatch ? { ...room.currentMatch } : null;
+  if (visibleMatch) delete visibleMatch.originalStats;
   return {
     code: room.code,
     phase: room.phase,
-    players: room.players.map((player, seed) => ({ ...player, seed: seed + 1 })),
+    players: room.players.map((player, seed) => {
+      const { reconnectTokenHash, socketId, ...publicPlayer } = player;
+      return { ...publicPlayer, seed: seed + 1 };
+    }),
     lastMatchStump: room.lastMatchStump ? {
       ...room.lastMatchStump,
       playerIds: [...room.lastMatchStump.playerIds],
@@ -822,7 +870,7 @@ function publicState(room) {
     } : null,
     currentMatch: room.currentMatch
       ? {
-          ...room.currentMatch,
+          ...visibleMatch,
           playerIds: [...room.currentMatch.playerIds],
           scores: { ...room.currentMatch.scores },
           suddenDeathWinners: [...room.currentMatch.suddenDeathWinners],
@@ -831,6 +879,9 @@ function publicState(room) {
           hitEffect: room.currentMatch.hitEffect ? { ...room.currentMatch.hitEffect } : null,
           pendingAdvance: room.currentMatch.pendingAdvance ? { ...room.currentMatch.pendingAdvance } : null,
           suddenDeathBeerDrank: { ...room.currentMatch.suddenDeathBeerDrank },
+          statPenalties: Object.fromEntries(
+            Object.entries(room.currentMatch.statPenalties).map(([id, stats]) => [id, { ...stats }])
+          ),
           lastSwing: room.currentMatch.lastSwing ? { ...room.currentMatch.lastSwing } : null,
           lastDrink: room.currentMatch.lastDrink ? { ...room.currentMatch.lastDrink } : null
         }

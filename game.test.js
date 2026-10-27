@@ -81,6 +81,19 @@ test("32 participants are capped and seeds play through to a champion", () => {
   assert.equal(room.history.at(-1).lane, "finals");
 });
 
+test("public room state does not expose reconnect credentials or stat restoration snapshots", () => {
+  const room = roomWithPlayers(2);
+  room.players[0].reconnectTokenHash = "private-token-hash";
+  room.players[0].socketId = "private-socket-id";
+  startNextMatch(room);
+
+  const state = publicState(room);
+
+  assert.equal(Object.hasOwn(state.players[0], "reconnectTokenHash"), false);
+  assert.equal(Object.hasOwn(state.players[0], "socketId"), false);
+  assert.equal(Object.hasOwn(state.currentMatch, "originalStats"), false);
+});
+
 test("beer checks cap intoxication at six", () => {
   const room = roomWithPlayers(2);
   startNextMatch(room);
@@ -222,6 +235,57 @@ test("a game point gives the opponent one last turn, then tied targets enter sud
   assert.equal(room.history[0].winnerId, "p1");
   assert.equal(room.history[0].scores.p1, 1);
   assert.deepEqual(room.history[0].suddenDeathWinners, ["p1"]);
+});
+
+test("sudden-death intoxication removes sober-up and lowers each intoxicated participant's highest stat per tied round", () => {
+  const room = roomWithPlayers(2);
+  room.defaultMatchSettings = { hitsToWin: 1, bestOf: 1, skipNpcOnly: false };
+  room.players[0].strength = 5;
+  room.players[0].dexterity = 3;
+  room.players[0].wisdom = 2;
+  room.players[1].strength = 3;
+  room.players[1].dexterity = 5;
+  room.players[1].wisdom = 3;
+  seedTournament(room);
+  startNextMatch(room);
+
+  applyAction(room, "p1", "hit");
+  confirmTurn(room, "p1");
+  applyAction(room, "p2", "hit");
+  confirmTurn(room, "p2");
+  const match = room.currentMatch;
+  assert.equal(match.suddenDeathActive, true);
+
+  room.players.forEach((player) => { player.drunk = 6; });
+  assert.equal(applyAction(room, "p1", "sober-up").ok, false);
+  assert.equal(room.players[0].drunk, 6);
+
+  const playSuddenDeathTurn = (playerId, action = "hit") => {
+    assert.equal(applyAction(room, playerId, "drink", () => 0.999).outcome, "drink-before-swing");
+    assert.equal(applyAction(room, playerId, action).ok, true);
+    confirmTurn(room, playerId);
+  };
+  playSuddenDeathTurn("p1");
+  playSuddenDeathTurn("p2");
+
+  assert.equal(room.players[0].strength, 4);
+  assert.equal(room.players[1].dexterity, 4);
+  assert.deepEqual(match.statPenalties.p1, { strength: 1, dexterity: 0, wisdom: 0 });
+  assert.deepEqual(match.statPenalties.p2, { strength: 0, dexterity: 1, wisdom: 0 });
+
+  playSuddenDeathTurn("p1");
+  playSuddenDeathTurn("p2");
+  assert.equal(room.players[0].strength, 3);
+  assert.equal(room.players[1].dexterity, 3);
+  assert.deepEqual(match.statPenalties.p1, { strength: 2, dexterity: 0, wisdom: 0 });
+  assert.deepEqual(match.statPenalties.p2, { strength: 0, dexterity: 2, wisdom: 0 });
+
+  playSuddenDeathTurn("p1");
+  playSuddenDeathTurn("p2", "miss");
+
+  assert.equal(room.currentMatch, null);
+  assert.equal(room.players[0].strength, 5);
+  assert.equal(room.players[1].dexterity, 5);
 });
 
 test("a player or NPC forfeits the game when they are more than two hits behind", () => {

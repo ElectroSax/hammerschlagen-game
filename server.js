@@ -2,7 +2,7 @@ const express = require("express");
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
-const { randomInt, randomUUID } = require("node:crypto");
+const { createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } = require("node:crypto");
 const { Server } = require("socket.io");
 const {
   MAX_PLAYERS,
@@ -57,6 +57,21 @@ function broadcast(room) {
 
 function hostOnly(socket, room) {
   return room && room.hostId === socket.id;
+}
+
+function playerForSocket(room, socket) {
+  if (!room || socket.data.roomCode !== room.code || !socket.data.playerId) return null;
+  const player = room.players.find((entry) => entry.id === socket.data.playerId);
+  return player?.socketId === socket.id ? player : null;
+}
+
+function hashReconnectToken(token) {
+  return createHash("sha256").update(token).digest();
+}
+
+function reconnectTokenMatches(player, token) {
+  if (typeof token !== "string" || !player?.reconnectTokenHash) return false;
+  return timingSafeEqual(hashReconnectToken(token), Buffer.from(player.reconnectTokenHash, "hex"));
 }
 
 function hasNpcOnlyMatch(room) {
@@ -190,9 +205,40 @@ io.on("connection", (socket) => {
 
     const player = createPlayer(socket.id, normalizedName);
     setPlayerStats(player, stats);
+    const reconnectToken = randomBytes(32).toString("base64url");
+    player.reconnectTokenHash = hashReconnectToken(reconnectToken).toString("hex");
+    player.socketId = socket.id;
+    player.connected = true;
     room.players.push(player);
     socket.join(room.code);
-    callback?.({ ok: true, state: roomState(room), playerId: socket.id });
+    socket.data.roomCode = room.code;
+    socket.data.playerId = player.id;
+    callback?.({ ok: true, state: roomState(room), playerId: player.id, reconnectToken });
+    broadcast(room);
+  });
+
+  socket.on("player:rejoin", ({ code, reconnectToken } = {}, callback) => {
+    const normalizedCode = typeof code === "string" ? code.trim().toUpperCase() : "";
+    const room = rooms.get(normalizedCode);
+    if (!room) {
+      callback?.({ ok: false, error: "Room not found. Check the code with your host." });
+      return;
+    }
+    const player = room.players.find((entry) => reconnectTokenMatches(entry, reconnectToken));
+    if (!player) {
+      callback?.({ ok: false, error: "No participant matches this saved reconnect token." });
+      return;
+    }
+    if (player.connected && player.socketId && io.sockets.sockets.has(player.socketId)) {
+      callback?.({ ok: false, error: "This participant is already connected." });
+      return;
+    }
+    player.socketId = socket.id;
+    player.connected = true;
+    socket.data.roomCode = room.code;
+    socket.data.playerId = player.id;
+    socket.join(room.code);
+    callback?.({ ok: true, state: roomState(room), playerId: player.id });
     broadcast(room);
   });
 
@@ -267,7 +313,15 @@ io.on("connection", (socket) => {
         if (!player) return;
         for (const stat of ["strength", "dexterity", "constitution", "wisdom"]) {
           const value = boundedStat(update[stat]);
-          if (value !== null) player[stat] = value;
+          if (value === null) continue;
+          const penalties = room.currentMatch?.statPenalties?.[player.id];
+          const originalStats = room.currentMatch?.originalStats?.[player.id];
+          if (originalStats && penalties && ["strength", "dexterity", "wisdom"].includes(stat)) {
+            originalStats[stat] = value;
+            player[stat] = Math.max(0, value - penalties[stat]);
+          } else {
+            player[stat] = value;
+          }
         }
         if (update.characterImage !== undefined && characterImages.includes(update.characterImage)) {
           player.characterImage = update.characterImage;
@@ -386,7 +440,7 @@ io.on("connection", (socket) => {
 
   socket.on("player:update-stats", ({ code, stats } = {}, callback) => {
     const room = rooms.get(typeof code === "string" ? code : "");
-    const player = room?.players.find((entry) => entry.id === socket.id);
+    const player = playerForSocket(room, socket);
     if (!room || room.phase !== "lobby" || !player || player.isNpc || !validStats(stats)) {
       callback?.({ ok: false, error: "You can change your stats before the tournament starts." });
       return;
@@ -398,7 +452,7 @@ io.on("connection", (socket) => {
 
   socket.on("player:update-image", ({ code, characterImage } = {}, callback) => {
     const room = rooms.get(typeof code === "string" ? code : "");
-    const player = room?.players.find((entry) => entry.id === socket.id);
+    const player = playerForSocket(room, socket);
     if (!room || room.phase !== "lobby" || !player || player.isNpc ||
         !characterImages.includes(characterImage)) {
       callback?.({ ok: false, error: "Choose an available character image before the tournament starts." });
@@ -598,7 +652,12 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const result = applyAction(room, socket.id, action, Math.random, position);
+    const player = playerForSocket(room, socket);
+    if (!player) {
+      callback?.({ ok: false, error: "Rejoin the room before taking a turn." });
+      return;
+    }
+    const result = applyAction(room, player.id, action, Math.random, position);
     callback?.(result);
     if (result.ok) {
       broadcast(room);
@@ -608,7 +667,12 @@ io.on("connection", (socket) => {
 
   socket.on("game:confirm-turn", ({ code } = {}, callback) => {
     const room = rooms.get(typeof code === "string" ? code : "");
-    const result = confirmTurn(room, socket.id);
+    const player = playerForSocket(room, socket);
+    if (!player) {
+      callback?.({ ok: false, error: "Rejoin the room before confirming your turn." });
+      return;
+    }
+    const result = confirmTurn(room, player.id);
     callback?.(result);
     if (!result.ok) return;
     broadcast(room);
@@ -617,9 +681,10 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     for (const room of rooms.values()) {
-      const index = room.players.findIndex((player) => player.id === socket.id);
-      if (index !== -1 && room.phase === "lobby") {
-        room.players.splice(index, 1);
+      const player = room.players.find((entry) => entry.socketId === socket.id);
+      if (player) {
+        player.connected = false;
+        player.socketId = null;
         broadcast(room);
       }
     }

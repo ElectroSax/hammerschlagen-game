@@ -7,6 +7,7 @@
   let role = null;
   let roomCode = null;
   let playerId = null;
+  let reconnectToken = null;
   let roomState = null;
   let animationFrame = null;
   let markerPosition = 0;
@@ -37,6 +38,49 @@
 
   function showError(message) {
     landingError.textContent = message || "";
+  }
+
+  function reconnectStorageKey(code) {
+    return `hammerschlagen-rejoin:${code.trim().toUpperCase()}`;
+  }
+
+  function savedReconnect(code) {
+    let raw;
+    try {
+      raw = localStorage.getItem(reconnectStorageKey(code));
+    } catch {
+      showError("Browser storage is unavailable, so saved rejoin is disabled.");
+      return null;
+    }
+    if (!raw) return null;
+    try {
+      const saved = JSON.parse(raw);
+      return typeof saved?.token === "string" && typeof saved?.name === "string" ? saved : null;
+    } catch {
+      localStorage.removeItem(reconnectStorageKey(code));
+      return null;
+    }
+  }
+
+  function updateRejoinButton() {
+    const button = document.querySelector("#rejoin-game");
+    const code = document.querySelector("#room-code").value;
+    const saved = savedReconnect(code);
+    button.classList.toggle("hidden", !saved);
+    if (saved) {
+      document.querySelector("#player-name").value = saved.name;
+      button.textContent = `Rejoin as ${saved.name}`;
+    }
+  }
+
+  function saveReconnect(code, name, token) {
+    try {
+      localStorage.setItem(reconnectStorageKey(code), JSON.stringify({ name, token }));
+      localStorage.setItem("hammerschlagen-last-room", code);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   function observeBeerRoll(match) {
@@ -232,9 +276,43 @@
     role = "player";
     roomCode = response.state.code;
     playerId = response.playerId;
+    reconnectToken = response.reconnectToken;
+    const reconnectSaved = saveReconnect(roomCode, document.querySelector("#player-name").value.trim(), reconnectToken);
     roomState = response.state;
     landing.classList.add("hidden");
     render();
+    if (!reconnectSaved) showToast("You joined, but this browser could not save your reconnect token.");
+  }
+
+  async function rejoinRoom(code = roomCode, token = reconnectToken) {
+    if (!code || !token) return false;
+    const response = await emitWithCallback("player:rejoin", { code, reconnectToken: token });
+    if (!response?.ok) {
+      const message = response?.error || "Could not rejoin this room.";
+      if (role === "player") showToast(message);
+      else showError(message);
+      return false;
+    }
+    role = "player";
+    roomCode = response.state.code;
+    playerId = response.playerId;
+    reconnectToken = token;
+    roomState = response.state;
+    landing.classList.add("hidden");
+    render();
+    return true;
+  }
+
+  function matchupStatsMarkup(player, match) {
+    return [
+      ["STR", "strength"],
+      ["DEX", "dexterity"],
+      ["CON", "constitution"],
+      ["WIS", "wisdom"]
+    ].map(([label, stat]) => {
+      const lowered = (match.statPenalties?.[player.id]?.[stat] || 0) > 0;
+      return `${label} <span class="${lowered ? "stat-lowered" : ""}">${player[stat]}</span>`;
+    }).join(" · ");
   }
 
   function statSelect(player, stat, title) {
@@ -275,7 +353,7 @@
         <div class="participant-heading">
           ${roomState.phase === "lobby" ? '<span class="drag-handle" aria-hidden="true">⠿</span>' : ""}
           <span class="seed">#${index + 1}</span>
-          <span class="player-name">${escapeHtml(player.name)} ${player.isNpc ? '<span class="status-pill">NPC</span>' : ""}</span>
+          <span class="player-name">${escapeHtml(player.name)} ${player.isNpc ? '<span class="status-pill">NPC</span>' : player.connected === false ? '<span class="status-pill">Disconnected</span>' : ""}</span>
           ${roomState.phase === "lobby" ? characterImagePicker(player) : ""}
           ${roomState.phase === "lobby" ? `
             <span class="order-buttons">
@@ -620,7 +698,7 @@
                        ${isHost && fighter.isNpc ? `<div class="npc-hit-chance">Hit chance ${fighterNpcHitChance}%</div>` : ""}
                        <div class="score">${match.scores[id]}<span class="muted">/${match.hitsToWin}</span></div>
                        ${match.bestOf === 3 ? `<div class="series-score">Games ${match.gameWins[id]} · Game ${match.gameNumber}/3</div>` : ""}
-                       <div class="help">STR ${fighter.strength} · DEX ${fighter.dexterity} · CON ${fighter.constitution} · WIS ${fighter.wisdom}${fighterDrunk ? `<br>Intoxicated x${fighterDrunk}` : ""}</div>
+                       <div class="help">${matchupStatsMarkup(fighter, match)}${fighterDrunk ? `<br>Intoxicated x${fighterDrunk}` : ""}</div>
                        ${beerMugsMarkup(fighter)}
                        ${isHost ? `<label class="host-intoxication">Set intoxication
                          <input type="number" min="0" max="6" step="1" value="${fighterDrunk}" ${currentBeerRoll?.rolling ? "disabled" : ""} data-match-drunk="${escapeHtml(id)}" aria-label="Set ${escapeHtml(fighter.name)} intoxication">
@@ -653,7 +731,7 @@
                      ? '<button id="drink-beer" class="button button-primary">Drink a Beer · roll d20</button>'
                      : isSuddenDeathDrinkRequired
                      ? '<button id="drink-beer" class="button button-primary">Drink a Beer before swinging · roll d20</button>'
-                     : isWaitingForConfirm ? "" : `<button id="swing" class="button button-primary" ${currentBeerRoll?.rolling ? "disabled" : ""}>${isManualNpcTurn ? "Swing for NPC" : "Swing"} <span class="key">SPACE BAR</span></button>${myBent ? `<button id="${isManualNpcTurn ? "host-straighten-npc" : "straighten"}" class="button button-secondary" ${currentBeerRoll?.rolling ? "disabled" : ""}>Straighten nail · uses turn</button>` : ""}${shownDrunk ? `<button id="${isManualNpcTurn ? "host-sober-up-npc" : "sober-up"}" class="button button-secondary" ${currentBeerRoll?.rolling ? "disabled" : ""}>Sober Up · uses turn</button>` : ""}`}
+                     : isWaitingForConfirm ? "" : `<button id="swing" class="button button-primary" ${currentBeerRoll?.rolling ? "disabled" : ""}>${isManualNpcTurn ? "Swing for NPC" : "Swing"} <span class="key">SPACE BAR</span></button>${myBent ? `<button id="${isManualNpcTurn ? "host-straighten-npc" : "straighten"}" class="button button-secondary" ${currentBeerRoll?.rolling ? "disabled" : ""}>Straighten nail · uses turn</button>` : ""}${shownDrunk && !match.suddenDeathActive ? `<button id="${isManualNpcTurn ? "host-sober-up-npc" : "sober-up"}" class="button button-secondary" ${currentBeerRoll?.rolling ? "disabled" : ""}>Sober Up · uses turn</button>` : ""}`}
                  </div>` : ""}
                  ${isMyTurn && !isWaitingForConfirm && !isPendingDrink && !isSuddenDeathDrinkRequired
                    ? '<p id="turn-timer" class="turn-timer" role="timer" aria-live="off">Swing automatically in 20s</p>' : ""}
@@ -1375,6 +1453,18 @@
 
   document.querySelector("#create-room").addEventListener("click", createRoom);
   document.querySelector("#join-form").addEventListener("submit", joinRoom);
+  document.querySelector("#room-code").addEventListener("input", updateRejoinButton);
+  document.querySelector("#rejoin-game").addEventListener("click", () => {
+    const code = document.querySelector("#room-code").value;
+    const saved = savedReconnect(code);
+    if (saved) rejoinRoom(code, saved.token);
+  });
+  try {
+    document.querySelector("#room-code").value = localStorage.getItem("hammerschlagen-last-room") || "";
+  } catch {
+    showError("Browser storage is unavailable, so saved rejoin is disabled.");
+  }
+  updateRejoinButton();
   document.addEventListener("keydown", (event) => {
     if (event.code !== "Space" || event.repeat) return;
     const practiceButtonFocused = event.target instanceof HTMLElement && event.target.id === "practice-swing";
@@ -1426,5 +1516,14 @@
     roomState = state;
     render();
   });
-  socket.on("connect_error", () => showError("Lost connection to the game server. Refresh to reconnect."));
+  socket.on("connect", () => {
+    if (role === "player" && roomCode && reconnectToken) rejoinRoom();
+  });
+  socket.on("disconnect", () => {
+    if (role === "player") showToast("Disconnected. Reconnecting to the room…");
+  });
+  socket.on("connect_error", () => {
+    if (role === "player") showToast("Lost connection to the game server. Rejoining is available when it reconnects.");
+    else showError("Lost connection to the game server. Refresh to reconnect.");
+  });
 })();

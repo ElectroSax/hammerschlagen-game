@@ -42,6 +42,7 @@ h2 { margin: 0 0 10px; font: 1.55rem "Rye", Georgia, serif; }
 .button:disabled { cursor: not-allowed; opacity: .45; transform: none; }
 .button-primary { background: var(--accent); color: #26170d; }
 .button-secondary { background: var(--panel-light); border: 1px solid var(--line); color: var(--text); }
+.landing #rejoin-game { margin-top: 12px; }
 .divider { align-items: center; color: var(--muted); display: flex; gap: 12px; margin: 26px 0 18px; font: 11px Consolas, monospace; text-transform: uppercase; }
 .divider::before, .divider::after { background: var(--line); content: ""; flex: 1; height: 1px; }
 .join-form { display: grid; gap: 12px; grid-template-columns: 1fr 1fr auto; text-align: left; }
@@ -58,6 +59,7 @@ footer { color: #927d68; font: 10px "DM Mono", monospace; margin-top: 24px; text
 .topline { align-items: center; display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; }
 .room-code { color: var(--accent); font: 500 1.5rem Consolas, monospace; letter-spacing: .12em; }
 .muted { color: var(--muted); }
+.stat-lowered { color: #ff7767; font-weight: 800; }
 .card { min-width: 0; padding: 22px; }
 .card h2 { margin-bottom: 6px; }
 .roster { display: grid; gap: 10px; margin-top: 18px; }
