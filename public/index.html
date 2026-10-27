@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#281b15">
+    <title>Hammerschlagen</title>
+    <link rel="stylesheet" href="/style.css">
+    <script src="/socket.io/socket.io.js" defer></script>
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div id="confetti-layer" class="confetti-layer" aria-hidden="true"></div>
+    <main class="shell">
+      <header class="masthead">
+        <p class="eyebrow">A multiplayer stump-side showdown</p>
+        <h1>Hammer<span>schlagen</span></h1>
+        <p class="intro">Take your turn. Find the sweet spot. Drive your nail home.</p>
+      </header>
+
+      <section id="landing" class="panel landing">
+        <div>
+          <p class="eyebrow">Start a game</p>
+          <h2>Gather your crew</h2>
+          <p>The host sets the bracket and each participant's stats. Up to 32 people and NPCs can enter a room.</p>
+        </div>
+        <button id="create-room" class="button button-primary">Host a game</button>
+        <div class="divider"><span>or join a room</span></div>
+        <form id="join-form" class="join-form">
+          <label>Room code<input id="room-code" name="code" maxlength="4" autocomplete="off" required></label>
+          <label>Your name<input id="player-name" name="name" maxlength="32" autocomplete="nickname" required></label>
+          <fieldset class="join-stats">
+            <legend>Set your stats (optional)</legend>
+            <label>Strength<select name="strength"><option>0</option><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select></label>
+            <label>Dexterity<select name="dexterity"><option>0</option><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select></label>
+            <label>Constitution<select name="constitution"><option>0</option><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select></label>
+            <label>Wisdom<select name="wisdom"><option>0</option><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select></label>
+          </fieldset>
+          <button class="button button-secondary" type="submit">Join game</button>
+        </form>
+        <p id="landing-error" class="error" role="status"></p>
+      </section>
+
+      <section id="host-view" class="hidden"></section>
+      <section id="player-view" class="hidden"></section>
+      <footer>Self-hosted game · Best played with a little friendly rivalry</footer>
+    </main>
+  </body>
+</html>
