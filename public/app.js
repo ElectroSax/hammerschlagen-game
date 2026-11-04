@@ -7,8 +7,11 @@
   let role = null;
   let roomCode = null;
   let playerId = null;
-  let reconnectToken = null;
   let roomState = null;
+  let draggedLobbyParticipantId = null;
+  let draggedLobbyPointerY = null;
+  let selectedLobbyParticipantId = null;
+  let selectedBackupFile = null;
   let animationFrame = null;
   let markerPosition = 0;
   let markerDirection = 1;
@@ -24,6 +27,12 @@
   let beerRollState = null;
   let beerRollInterval = null;
   let beerRollTimeout = null;
+  let luckyRollState = null;
+  let luckyRollInterval = null;
+  let luckyRollTimeout = null;
+  let lastLuckyRollKey = null;
+  let practiceLuckyInterval = null;
+  let practiceLuckyTimeout = null;
   let heldSwingAnimationKey = null;
   let audioContext = null;
   let lastSoundSwingKey = "";
@@ -40,46 +49,73 @@
     landingError.textContent = message || "";
   }
 
-  function reconnectStorageKey(code) {
-    return `hammerschlagen-rejoin:${code.trim().toUpperCase()}`;
-  }
-
-  function savedReconnect(code) {
-    let raw;
-    try {
-      raw = localStorage.getItem(reconnectStorageKey(code));
-    } catch {
-      showError("Browser storage is unavailable, so saved rejoin is disabled.");
-      return null;
-    }
-    if (!raw) return null;
-    try {
-      const saved = JSON.parse(raw);
-      return typeof saved?.token === "string" && typeof saved?.name === "string" ? saved : null;
-    } catch {
-      localStorage.removeItem(reconnectStorageKey(code));
-      return null;
-    }
+  function guestMarkup() {
+    const draft = { id: "new-player", name: "Your player", strength: 3, dexterity: 3, constitution: 3, wisdom: 3 };
+    const claimableNpcs = roomState.players.filter((participant) => participant.isNpc);
+    return `<div class="view">
+      <div class="topline"><div><p class="eyebrow">Room ${escapeHtml(roomState.code)}</p><h2>You're in the room</h2></div><span class="status-pill">Guest</span></div>
+      <section class="card">
+        <h3>Choose how to join</h3>
+        <p class="muted">Create a character with your own name and stats, or claim an available NPC to join using their name and stats.</p>
+        ${roomState.phase !== "lobby" ? '<p class="error" role="status">The tournament has started, so new player profiles cannot be created.</p>' : `
+          <form id="create-profile-form">
+            <label>Your character name<input name="name" maxlength="32" autocomplete="nickname" required></label>
+            <div class="stats-grid">
+              ${statSelect(draft, "strength", "Strength")}
+              ${statSelect(draft, "dexterity", "Dexterity")}
+              ${statSelect(draft, "constitution", "Constitution")}
+              ${statSelect(draft, "wisdom", "Wisdom")}
+            </div>
+            <button class="button button-primary" type="submit">Create player</button>
+          </form>
+          ${claimableNpcs.length ? `<h4>Or claim an NPC</h4><div class="claim-character-list">${claimableNpcs.map((npc) =>
+            `<button type="button" class="claim-character" data-claim-npc="${escapeHtml(npc.id)}"><img src="${characterImageUrl(npc.characterImage || "Generic NPC.png")}" alt=""><span><strong>${escapeHtml(npc.name)}</strong><small>STR ${npc.strength} · DEX ${npc.dexterity} · CON ${npc.constitution} · WIS ${npc.wisdom}</small></span></button>`
+          ).join("")}</div>` : '<p class="help">No NPCs are available to claim yet.</p>'}`}
+        <p id="guest-error" class="error" role="status"></p>
+        <p class="help">${roomState.pendingPlayerCount || 0} guest${roomState.pendingPlayerCount === 1 ? "" : "s"} still need to choose a character before the tournament can start.</p>
+      </section>
+    </div>`;
   }
 
   function updateRejoinButton() {
     const button = document.querySelector("#rejoin-game");
     const code = document.querySelector("#room-code").value;
-    const saved = savedReconnect(code);
-    button.classList.toggle("hidden", !saved);
-    if (saved) {
-      document.querySelector("#player-name").value = saved.name;
-      button.textContent = `Rejoin as ${saved.name}`;
-    }
+    const name = document.querySelector("#player-name").value.trim();
+    button.disabled = !code.trim() || !name;
+    button.classList.toggle("hidden", false);
+    button.textContent = name ? `Rejoin as ${name}` : "Rejoin using room code and name";
   }
 
-  function saveReconnect(code, name, token) {
+  function bindGuestControls() {
+    document.querySelector("#create-profile-form")?.addEventListener("submit", createPlayerProfile);
+    document.querySelectorAll("[data-claim-npc]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const response = await emitWithCallback("player:claim-npc", {
+          code: roomCode,
+          npcId: button.dataset.claimNpc
+        });
+        if (!response?.ok) {
+          const error = document.querySelector("#guest-error");
+          if (error) error.textContent = response?.error || "Could not claim that NPC.";
+          return;
+        }
+        role = "player";
+        playerId = response.playerId;
+        roomState = response.state;
+        saveLastPlayer(roomCode, response.name);
+        render();
+      });
+    });
+  }
+
+  function saveLastPlayer(code, name) {
+    document.querySelector("#room-code").value = code;
+    document.querySelector("#player-name").value = name;
+    updateRejoinButton();
     try {
-      localStorage.setItem(reconnectStorageKey(code), JSON.stringify({ name, token }));
-      localStorage.setItem("hammerschlagen-last-room", code);
-      return true;
+      localStorage.setItem("hammerschlagen-last-player", JSON.stringify({ code, name }));
     } catch {
-      return false;
+      showError("You joined, but this browser could not save the room code and name.");
     }
   }
 
@@ -112,6 +148,30 @@
     return beerRollState?.key === key ? beerRollState : null;
   }
 
+  function observeLuckyRoll(luckyBullseye) {
+    if (!luckyBullseye) return null;
+    const key = `${luckyBullseye.matchId}:${luckyBullseye.count}`;
+    if (key !== lastLuckyRollKey) {
+      lastLuckyRollKey = key;
+      playSound("dice");
+      luckyRollState = { key, rolling: true, value: Math.floor(Math.random() * 20) + 1 };
+      clearInterval(luckyRollInterval);
+      clearTimeout(luckyRollTimeout);
+      luckyRollInterval = setInterval(() => {
+        if (luckyRollState?.key !== key || !luckyRollState.rolling) return;
+        luckyRollState.value = Math.floor(Math.random() * 20) + 1;
+        const face = document.querySelector(".lucky-die b");
+        if (face) face.textContent = luckyRollState.value;
+      }, 80);
+      luckyRollTimeout = setTimeout(() => {
+        clearInterval(luckyRollInterval);
+        luckyRollState = { key, rolling: false, value: luckyBullseye.roll };
+        render();
+      }, 1600);
+    }
+    return luckyRollState?.key === key ? luckyRollState : null;
+  }
+
   function calculateSwingStats(player, isBent, hasBonus, isSuddenDeath = false) {
     const strength = isBent ? 0 : hasBonus ? 5 : player.strength;
     const baseWidth = Math.max(5, 16 + strength * 2.8 - player.drunk * 1.5);
@@ -120,7 +180,8 @@
     const speedAtZeroDexterity = 105 / (0.7 + 3 * 0.15) * 2.5;
     return {
       width,
-      criticalWidth: isSuddenDeath ? 0 : isBent ? 2 : Math.min(7, 2 + player.strength * 0.25),
+      criticalWidth: isSuddenDeath ? 0 : width * 0.05,
+      luckyWidth: isSuddenDeath ? 0 : width * 0.1,
       bendWidth: (100 - width) * (0.25 + 0.5 * player.dexterity / 5) / 2,
       wisdomSlowdown: player.wisdom * 0.12,
       speed: Math.min(450, speedAtZeroDexterity * 0.75 / dexterityFactor)
@@ -258,10 +319,43 @@
   async function joinRoom(event) {
     event.preventDefault();
     showError("");
+    const response = await emitWithCallback("player:enter-room", {
+      code: document.querySelector("#room-code").value
+    });
+    if (!response?.ok) {
+      showError(response?.error || "Could not join this room.");
+      return;
+    }
+    role = "guest";
+    roomCode = response.state.code;
+    playerId = null;
+    roomState = response.state;
+    landing.classList.add("hidden");
+    render();
+  }
+
+  async function reenterRoom(code) {
+    const response = await emitWithCallback("player:enter-room", { code });
+    if (!response?.ok) {
+      const error = document.querySelector("#guest-error");
+      if (error) error.textContent = response?.error || "Could not reconnect to this room.";
+      else showError(response?.error || "Could not reconnect to this room.");
+      return false;
+    }
+    role = "guest";
+    roomCode = response.state.code;
+    playerId = null;
+    roomState = response.state;
+    render();
+    return true;
+  }
+
+  async function createPlayerProfile(event) {
+    event.preventDefault();
     const form = new FormData(event.currentTarget);
-    const response = await emitWithCallback("player:join", {
-      code: document.querySelector("#room-code").value,
-      name: document.querySelector("#player-name").value,
+    const response = await emitWithCallback("player:create-profile", {
+      code: roomCode,
+      name: form.get("name"),
       stats: {
         strength: Number(form.get("strength")),
         dexterity: Number(form.get("dexterity")),
@@ -270,23 +364,20 @@
       }
     });
     if (!response?.ok) {
-      showError(response?.error || "Could not join this room.");
+      const error = document.querySelector("#guest-error");
+      if (error) error.textContent = response?.error || "Could not create your player.";
       return;
     }
     role = "player";
-    roomCode = response.state.code;
     playerId = response.playerId;
-    reconnectToken = response.reconnectToken;
-    const reconnectSaved = saveReconnect(roomCode, document.querySelector("#player-name").value.trim(), reconnectToken);
     roomState = response.state;
-    landing.classList.add("hidden");
+    saveLastPlayer(roomCode, String(form.get("name")).trim());
     render();
-    if (!reconnectSaved) showToast("You joined, but this browser could not save your reconnect token.");
   }
 
-  async function rejoinRoom(code = roomCode, token = reconnectToken) {
-    if (!code || !token) return false;
-    const response = await emitWithCallback("player:rejoin", { code, reconnectToken: token });
+  async function rejoinRoom(code, name) {
+    if (!code || !name) return false;
+    const response = await emitWithCallback("player:rejoin", { code, name });
     if (!response?.ok) {
       const message = response?.error || "Could not rejoin this room.";
       if (role === "player") showToast(message);
@@ -296,11 +387,53 @@
     role = "player";
     roomCode = response.state.code;
     playerId = response.playerId;
-    reconnectToken = token;
+    saveLastPlayer(roomCode, name);
     roomState = response.state;
     landing.classList.add("hidden");
     render();
     return true;
+  }
+
+  async function restoreTournamentBackup() {
+    if (!selectedBackupFile) return;
+    let backup;
+    try {
+      backup = JSON.parse(await selectedBackupFile.text());
+    } catch {
+      showError("Could not read the backup file. Choose a valid JSON backup.");
+      return;
+    }
+    const response = await emitWithCallback("host:restore", { backup });
+    if (!response?.ok) {
+      showError(response?.error || "Could not restore this tournament backup.");
+      return;
+    }
+    role = "host";
+    roomCode = response.state.code;
+    roomState = response.state;
+    selectedBackupFile = null;
+    document.querySelector("#backup-file").value = "";
+    document.querySelector("#restore-backup").disabled = true;
+    landing.classList.add("hidden");
+    render();
+    showToast(`Tournament restored. Share the new room code ${roomCode} with participants.`);
+  }
+
+  async function downloadTournamentBackup() {
+    const response = await emitWithCallback("host:backup", { code: roomCode });
+    if (!response?.ok) {
+      showToast(response?.error || "Could not create a tournament backup.");
+      return;
+    }
+    const contents = JSON.stringify(response.backup, null, 2);
+    const blob = new Blob([contents], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `hammerschlagen-${roomCode}-backup.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    showToast("Tournament backup downloaded.");
   }
 
   function matchupStatsMarkup(player, match) {
@@ -317,7 +450,7 @@
 
   function statSelect(player, stat, title) {
     return `<label>${title}
-      <select data-stat="${stat}" data-player="${player.id}" aria-label="${escapeHtml(player.name)} ${title}">
+      <select name="${stat}" data-stat="${stat}" data-player="${player.id}" aria-label="${escapeHtml(player.name)} ${title}">
         ${[0, 1, 2, 3, 4, 5].map((value) => `<option value="${value}" ${player[stat] === value ? "selected" : ""}>${value}</option>`).join("")}
       </select>
     </label>`;
@@ -325,6 +458,14 @@
 
   function characterImageUrl(filename) {
     return `/assets/${encodeURIComponent(filename)}`;
+  }
+
+  function luckyZonesMarkup(stats) {
+    if (!stats?.luckyWidth) return "";
+    const luckyHalfWidth = stats.luckyWidth / 2;
+    const bullseyeHalfWidth = stats.criticalWidth / 2;
+    return `<div class="lucky-bullseye-zone" aria-label="Lucky bullseye zone" style="left:${50 - bullseyeHalfWidth - luckyHalfWidth}%;width:${luckyHalfWidth}%"></div>
+      <div class="lucky-bullseye-zone" aria-label="Lucky bullseye zone" style="left:${50 + bullseyeHalfWidth}%;width:${luckyHalfWidth}%"></div>`;
   }
 
   function characterImagePicker(player) {
@@ -354,12 +495,10 @@
           ${roomState.phase === "lobby" ? '<span class="drag-handle" aria-hidden="true">⠿</span>' : ""}
           <span class="seed">#${index + 1}</span>
           <span class="player-name">${escapeHtml(player.name)} ${player.isNpc ? '<span class="status-pill">NPC</span>' : player.connected === false ? '<span class="status-pill">Disconnected</span>' : ""}</span>
-          ${roomState.phase === "lobby" ? characterImagePicker(player) : ""}
-          ${roomState.phase === "lobby" ? `
-            <span class="order-buttons">
-              <button class="icon-button" data-move="${index - 1}" aria-label="Move ${escapeHtml(player.name)} up" ${index === 0 ? "disabled" : ""}>↑</button>
-              <button class="icon-button" data-move="${index + 1}" aria-label="Move ${escapeHtml(player.name)} down" ${index === roomState.players.length - 1 ? "disabled" : ""}>↓</button>
-            </span>` : `<span class="muted">${player.wins} win${player.wins === 1 ? "" : "s"}</span>`}
+          ${characterImagePicker(player)}
+          <button type="button" class="button button-secondary participant-type-toggle" data-participant-type="${escapeHtml(player.id)}">${player.isNpc ? "Switch to player" : "Switch to NPC"}</button>
+          ${roomState.phase === "lobby" && player.isNpc ? `<button type="button" class="button button-secondary participant-type-toggle" data-remove-npc="${escapeHtml(player.id)}">Remove NPC</button>` : ""}
+          ${roomState.phase !== "lobby" ? `<span class="muted">${player.wins} win${player.wins === 1 ? "" : "s"}</span>` : ""}
         </div>
         <div class="stats-grid">
           ${statSelect(player, "strength", "Strength")}
@@ -371,34 +510,132 @@
       </div>`).join("");
   }
 
+  function firstRoundMatchupsMarkup() {
+    const players = roomState.players;
+    if (!players.length) return "";
+    const defaultMatchups = [];
+    for (let index = 0; index < players.length; index += 2) {
+      defaultMatchups.push([players[index]?.id || null, players[index + 1]?.id || null]);
+    }
+    const matchups = roomState.firstRoundMatchups || defaultMatchups;
+    const sources = [];
+    const participantById = new Map(players.map((player) => [player.id, player]));
+    const participantMarkup = (player, seed) => `
+      <article class="first-round-player-card" data-player-id="${escapeHtml(player.id)}" data-seed="${seed}">
+        <div class="first-round-player-heading">
+          <div class="first-round-player-identity">
+            <button type="button" class="matchup-drag-handle" draggable="false" data-drag-player="${escapeHtml(player.id)}" aria-label="Drag ${escapeHtml(player.name)} to change seed" title="Drag to change seed">⠿</button>
+            <span class="seed">#${seed}</span>
+            <img src="${characterImageUrl(player.characterImage || "Generic NPC.png")}" alt="">
+            <span class="first-round-player-type status-pill">${player.isNpc ? "NPC" : player.connected === false ? "Disconnected" : "Player"}</span>
+          </div>
+          <div class="first-round-player-actions">
+            ${characterImagePicker(player)}
+            <button type="button" class="button button-secondary participant-type-toggle" data-participant-type="${escapeHtml(player.id)}">${player.isNpc ? "Switch to player" : "Switch to NPC"}</button>
+            <button type="button" class="button button-secondary participant-type-toggle" data-remove-participant="${escapeHtml(player.id)}">${player.isNpc ? "Remove NPC" : "Remove player"}</button>
+          </div>
+        </div>
+        <form class="first-round-name-form" data-player-name-form="${escapeHtml(player.id)}">
+          <label>Character name
+            <input name="name" value="${escapeHtml(player.name)}" maxlength="32" required>
+          </label>
+          <button type="submit" class="button button-secondary">Save name</button>
+        </form>
+        <div class="stats-grid first-round-stats">
+          ${statSelect(player, "strength", "Strength")}
+          ${statSelect(player, "dexterity", "Dexterity")}
+          ${statSelect(player, "constitution", "Constitution")}
+          ${statSelect(player, "wisdom", "Wisdom")}
+        </div>
+      </article>`;
+    const slotMarkup = (playerId, seed) => playerId === null
+      ? '<span class="first-round-bye-label" data-bye-slot="true" aria-label="Drop a character here to assign the bye">BYE</span>'
+      : participantMarkup(participantById.get(playerId), players.findIndex((player) => player.id === playerId) + 1 || seed);
+    matchups.forEach((matchup, index) => {
+      const byePlayerId = matchup.find((playerId) => playerId !== null);
+      const hasBye = matchup.includes(null);
+      sources.push({
+        kind: hasBye ? "bye" : "match",
+        matchNumber: hasBye ? null : sources.filter((source) => source.kind === "match").length + 1,
+        player: participantById.get(byePlayerId),
+        markup: `<div class="first-round-matchup${hasBye ? " first-round-bye-match" : ""}">
+          <span class="first-round-match-label">${hasBye ? "Bye" : `Match ${sources.filter((source) => source.kind === "match").length + 1}`}</span>
+          <div class="first-round-match-contest">
+            ${slotMarkup(matchup[0], index * 2 + 1)}
+            <span class="first-round-vs">vs</span>
+            ${slotMarkup(matchup[1], index * 2 + 2)}
+          </div>
+        </div>`
+      });
+    });
+    const progressions = [];
+    for (let index = 0; index < sources.length; index += 2) {
+      const feeders = sources.slice(index, index + 2);
+      const futureSlots = feeders.map((source) => source.kind === "match"
+        ? `<div class="bracket-future-slot">Winner of Match ${source.matchNumber}</div>`
+        : `<div class="bracket-future-slot">${escapeHtml(source.player.name)} advances by bye</div>`);
+      const hasFutureMatch = futureSlots.length === 2;
+      const nextRound = hasFutureMatch
+        ? `<div class="bracket-next-card"><span class="bracket-next-label">Potential next-round matchup</span>${futureSlots[0]}<span class="first-round-vs">vs</span>${futureSlots[1]}</div>`
+        : `<div class="bracket-next-card bracket-advance-card"><span class="bracket-next-label">${feeders[0].kind === "bye" ? "Next round" : "Tournament result"}</span><div class="bracket-future-slot">${feeders[0].kind === "bye" ? futureSlots[0] : `Winner of Match ${feeders[0].matchNumber} becomes the champion`}</div></div>`;
+      const connector = hasFutureMatch
+        ? '<svg class="bracket-connector-wide" viewBox="0 0 40 100" preserveAspectRatio="none" aria-hidden="true"><path d="M0 25H20V75H0M20 50H40"></path></svg><svg class="bracket-connector-narrow" viewBox="0 0 40 40" preserveAspectRatio="none" aria-hidden="true"><path d="M20 0V40"></path></svg>'
+        : '<svg class="bracket-connector-wide" viewBox="0 0 40 100" preserveAspectRatio="none" aria-hidden="true"><path d="M0 50H40"></path></svg><svg class="bracket-connector-narrow" viewBox="0 0 40 40" preserveAspectRatio="none" aria-hidden="true"><path d="M20 0V40"></path></svg>';
+      progressions.push(`<div class="bracket-progression ${hasFutureMatch ? "has-future-match" : "single-progression"}">
+        <div class="bracket-feeders">${feeders.map((source) => source.markup).join("")}</div>
+        <div class="bracket-connector">${connector}</div>
+        ${nextRound}
+      </div>`);
+    }
+    return `<section class="first-round-section" aria-label="First-round matchups">
+      <div class="topline"><h4>Tournament bracket</h4><span class="status-pill">${Math.floor(players.length / 2)} first-round ${players.length === 2 ? "matchup" : "matchups"}${players.length % 2 ? " · 1 bye" : ""}</span></div>
+      <p class="help">Drag a character handle onto another player to change seeds, or onto BYE to assign the bye. If dragging is unavailable, click a character handle, then click BYE. Lines connect first-round matchups to possible next-round opponents.</p>
+      <div class="bracket-round-headings"><h5>First-round matchups</h5><h5>Next round</h5></div>
+      <div class="bracket-progression-list">${progressions.join("")}</div>
+    </section>`;
+  }
+
   function hostMarkup() {
-    const canStart = roomState.players.length >= 2 && roomState.phase === "lobby";
+    const canStart = roomState.players.length >= 2 &&
+      roomState.pendingPlayerCount === 0 && roomState.phase === "lobby";
     const settings = roomState.defaultMatchSettings;
     return `
       <div class="view">
         <div class="topline">
           <div><p class="eyebrow">Host controls</p><h2>Your game room</h2></div>
-          <div class="room-code">${roomState.code}</div>
+          <div class="host-room-actions">
+            <div class="room-code">${roomState.code}</div>
+            <button id="download-backup" class="button button-secondary" type="button">Download tournament backup</button>
+          </div>
         </div>
         <section class="card">
           <p class="help">Share this code with up to 32 participants: <strong>${roomState.code}</strong>. Players open this page on their own devices and enter the code.</p>
-          <div class="topline"><h3>Participants &amp; bracket seeds</h3><span class="status-pill">${roomState.players.length}/32 joined</span></div>
-          ${roomState.phase === "lobby" ? '<p class="help">Drag participants to set their seeds; each adjacent pair forms a first-round matchup. Use the arrows if dragging is unavailable.</p>' : ""}
-          ${roomState.players.length ? `<div class="roster">${hostRoster()}</div>` : `<p class="muted">Waiting for players…</p>`}
+          <div class="topline"><h3>Participants &amp; bracket seeds</h3><span class="status-pill">${roomState.players.length}/32 players</span></div>
+          ${roomState.pendingPlayerCount ? `<p class="help">${roomState.pendingPlayerCount} guest${roomState.pendingPlayerCount === 1 ? "" : "s"} must create a character or claim an NPC before the tournament can start.</p>` : ""}
+          ${roomState.phase === "lobby" ? firstRoundMatchupsMarkup() : ""}
+          ${roomState.players.length && roomState.phase !== "lobby" ? `<div class="roster">${hostRoster()}</div>` : !roomState.players.length ? `<p class="muted">Waiting for players…</p>` : ""}
           ${roomState.phase === "lobby" ? `
             <form id="add-npc-form" class="npc-form">
               <label>NPCs (Name,Strength,Dexterity,Constitution,Wisdom)
                 <textarea name="entries" rows="4" placeholder="Rivet,5,5,3,4&#10;Sparky,2,4,1,3" required></textarea>
               </label>
-              <button class="button button-secondary" type="submit" ${roomState.players.length >= 32 ? "disabled" : ""}>Add NPCs</button>
+              <button class="button button-secondary" type="submit" ${roomState.players.length + (roomState.pendingPlayerCount || 0) >= 32 ? "disabled" : ""}>Add NPCs</button>
             </form>
             <div class="lobby-actions">
               <button id="randomize-bracket" class="button button-secondary" ${roomState.players.length < 2 ? "disabled" : ""}>Randomize bracket order</button>
               <button id="start-tournament" class="button button-primary" ${canStart ? "" : "disabled"}>Start tournament</button>
             </div>
+            <label class="mode-select">Tournament format
+              <select id="tournament-format">
+                <option value="single" ${roomState.tournamentFormat === "single" ? "selected" : ""}>Single elimination</option>
+                <option value="double" ${roomState.tournamentFormat !== "single" ? "selected" : ""}>Double elimination</option>
+              </select>
+            </label>
             ${matchSettingsMarkup(settings, "Default match format")}
             ${winnerChoiceMarkup(roomState.players.slice(0, 2).map((player) => player.id))}
-            <p class="help">This is a double-elimination tournament: one loss moves a participant to the losers bracket, and a second loss eliminates them. You can change stats during the tournament.</p>
+            <p class="help">${roomState.tournamentFormat === "single"
+              ? "Single elimination: one loss eliminates a participant."
+              : "Double elimination: one loss moves a participant to the losers bracket, and a second loss eliminates them."} You can change stats during the tournament.</p>
           ` : `<p class="help">Adjust any participant's stats above during the tournament. Changes apply to their next swing.</p>`}
           <label class="mode-select">NPC turn mode
             <select id="npc-match-mode">
@@ -515,9 +752,60 @@
       !match.suddenDeathBeerDrank?.[activeId]
     );
     const pendingAdvance = match?.pendingAdvance;
+    const isWaitingForConfirm = Boolean(pendingAdvance);
+    const pendingBullseye = Boolean(
+      pendingAdvance && match?.lastSwing?.playerId === pendingAdvance.playerId &&
+      match.lastSwing.action === "bullseye"
+    );
+    const resultMatch = match || roomState.history.at(-1);
+    const luckyBullseye = resultMatch?.lastLuckyBullseye;
+    const latestResultSwing = resultMatch?.lastSwing;
+    const isLatestLuckySwing = Boolean(
+      luckyBullseye && latestResultSwing?.count === luckyBullseye.swingCount
+    );
+    const luckyRoll = isLatestLuckySwing ? observeLuckyRoll(luckyBullseye) : null;
+    const luckyRollMarkup = isLatestLuckySwing
+      ? `<div class="lucky-roll ${luckyRoll?.rolling ? "rolling" : ""}" role="status" aria-live="polite">
+          <span class="beer-die lucky-die ${luckyRoll?.rolling ? "rolling" : ""}" aria-label="Twenty-sided die ${luckyRoll?.rolling ? "rolling" : `showing ${luckyRoll?.value}`}">${renderD20(luckyRoll?.value ?? luckyBullseye.roll)}</span>
+          <strong>${luckyRoll?.rolling ? `Rolling for ${escapeHtml(playerName(luckyBullseye.playerId))}…` : luckyBullseye.success ? `${escapeHtml(playerName(luckyBullseye.playerId))} got a Lucky Bullseye!` : `${escapeHtml(playerName(luckyBullseye.playerId))} rolled ${luckyBullseye.roll} — regular hit.`}</strong>
+        </div>`
+      : "";
+    const pendingLuckyBullseye = Boolean(
+      pendingBullseye && match?.lastSwing?.luckyBullseye?.success
+    );
+    const turnBannerMessage = isWaitingForConfirm && match?.lastSwing?.luckyBullseye
+      ? luckyRoll?.rolling
+        ? `${escapeHtml(playerName(pendingAdvance.playerId))} hit the lucky zone — rolling d20…`
+        : luckyBullseye?.success
+          ? `${escapeHtml(playerName(pendingAdvance.playerId))} got a Lucky Bullseye!`
+          : `${escapeHtml(playerName(pendingAdvance.playerId))} rolled ${luckyBullseye?.roll} — regular hit.`
+      : isWaitingForConfirm
+        ? pendingBullseye
+          ? `${escapeHtml(playerName(pendingAdvance.playerId))} hit a BULLSEYE for 2 hits — ${match.gamePointId === pendingAdvance.playerId ? `${escapeHtml(playerName(match.playerIds.find((id) => id !== pendingAdvance.playerId)))} gets one final turn.` : "end the turn."}`
+          : match.gamePointId === pendingAdvance.playerId
+            ? `${escapeHtml(playerName(pendingAdvance.playerId))} reached the target — ${escapeHtml(playerName(match.playerIds.find((id) => id !== pendingAdvance.playerId)))} gets one final turn.`
+            : pendingAdvance.outcome === "sobered-up"
+              ? `${escapeHtml(playerName(pendingAdvance.playerId))} sobered up — end the turn.`
+              : match.suddenDeathActive
+                ? `${escapeHtml(playerName(pendingAdvance.playerId))} ${["hit", "bullseye", "sudden-death"].includes(pendingAdvance.outcome) ? "hit" : "did not hit"} in sudden death — end the turn.`
+                : `${escapeHtml(playerName(pendingAdvance.playerId))}'s turn: ${escapeHtml(pendingAdvance.outcome)} — end the turn.`
+        : isPendingDrink
+          ? "Full miss! Drink a beer to finish your turn."
+          : isSuddenDeathDrinkRequired
+            ? "Sudden death: drink a beer before you swing."
+            : activePlayer?.isNpc
+              ? isManualNpcTurn
+                ? `Host controls ${escapeHtml(activePlayer.name)}'s turn`
+                : roomState.npcStepRequired
+                  ? `Waiting for host to start ${escapeHtml(activePlayer.name)}'s turn`
+                  : roomState.npcStepInProgress
+                    ? `${escapeHtml(activePlayer.name)} is lining up a swing…`
+                    : `${escapeHtml(activePlayer.name)} is swinging…`
+              : isMyTurn
+                ? "Your turn"
+                : `${escapeHtml(activePlayer?.name || "Player")} is up`;
     const canPlayerConfirm = Boolean(playerId && pendingAdvance?.playerId === playerId);
     const canEndTurn = Boolean((isHost && pendingAdvance) || canPlayerConfirm);
-    const isWaitingForConfirm = Boolean(pendingAdvance);
     const myBent = Boolean(match?.bentIds.includes(controlledPlayerId));
     const lastDrink = match?.lastDrink;
     const currentBeerRoll = observeBeerRoll(match);
@@ -552,10 +840,11 @@
     const finalRightBendStart = finalTargetStart + (finalStats?.width || 0);
     const finalRightBendWidth = finalStats ? Math.min(finalStats.bendWidth, 100 - finalRightBendStart) : 0;
     const finalSwingMarkup = finalSwing
-      ? `<div class="last-swing"><p class="help">Last swing by ${escapeHtml(playerName(finalSwing.playerId))}: ${escapeHtml(finalSwing.action)}</p><div class="meter ${finalSwing.drunk ? "wobble" : ""}" aria-label="Last swing meter" data-speed="${finalStats?.speed || 0}" style="--wiggle:${Math.min(12, 2 + (finalSwing.drunk || 0) * 2)}px;--wiggle-time:${Math.max(120, 280 - (finalSwing.drunk || 0) * 30)}ms">
+      ? `<div class="last-swing"><p class="help">Last swing by ${escapeHtml(playerName(finalSwing.playerId))}: ${finalSwing.action === "bullseye" ? "BULLSEYE! +2 hits" : escapeHtml(finalSwing.action)}</p><div class="meter ${finalSwing.drunk ? "wobble" : ""}" aria-label="Last swing meter" data-speed="${finalStats?.speed || 0}" style="--wiggle:${Math.min(12, 2 + (finalSwing.drunk || 0) * 2)}px;--wiggle-time:${Math.max(120, 280 - (finalSwing.drunk || 0) * 30)}ms">
           ${finalStats ? `<div class="bend-risk" style="left:${Math.max(0, finalTargetStart - finalLeftBendWidth)}%;width:${finalLeftBendWidth}%"></div>
             <div class="target-zone" style="left:${finalTargetStart}%;width:${finalStats.width}%"></div>
             <div class="bend-risk" style="left:${finalRightBendStart}%;width:${finalRightBendWidth}%"></div>
+            ${luckyZonesMarkup(finalStats)}
             ${finalStats.criticalWidth ? `<div class="bullseye-zone" style="left:${50 - finalStats.criticalWidth / 2}%;width:${finalStats.criticalWidth}%"></div>` : ""}` : ""}
           <div class="needle held" style="left:${finalSwing.position}%"></div></div></div>`
       : "";
@@ -583,11 +872,14 @@
       ...(match ? [{ ...match, status: "active" }] : []),
       ...roomState.pendingMatches.map((entry) => ({ ...entry, status: "upcoming" }))
     ];
-    const bracket = [
-      ["winners", "Winners bracket"],
-      ["losers", "Losers bracket"],
-      ["finals", "Championship finals"]
-    ].map(([lane, label]) => {
+    const bracketLanes = roomState.tournamentFormat === "single"
+      ? [["winners", "Single-elimination bracket"]]
+      : [
+          ["winners", "Winners bracket"],
+          ["losers", "Losers bracket"],
+          ["finals", "Championship finals"]
+        ];
+    const bracket = bracketLanes.map(([lane, label]) => {
       const laneMatches = bracketMatches.filter((entry) => (entry.lane || "winners") === lane);
       const rounds = new Map();
       laneMatches.forEach((entry) => {
@@ -656,6 +948,7 @@
       <div class="game-layout match-progress-layout">
         <section class="card">
           <p class="eyebrow">Tournament · Round ${roomState.roundNumber}</p>
+          ${!match ? luckyRollMarkup : ""}
           ${roomState.championId
             ? `<h2>Champion crowned</h2><p class="champion">${escapeHtml(playerName(roomState.championId))}</p>${completedMatchCardsMarkup}${finalSwingMarkup}<div class="match-stump-inline">${stumpMarkup(completedMatch)}</div><div class="final-spark-stage"><div id="hit-spark" class="hit-spark" aria-hidden="true"></div></div>`
             : match
@@ -688,7 +981,7 @@
                    ${match.playerIds.map((id, index) => {
                      const fighter = findPlayer(id);
                      const fighterNpcHitChance = Math.round(
-                       20 + (fighter.strength + fighter.dexterity + fighter.wisdom) * 5
+                       33 + ((fighter.strength + fighter.dexterity + fighter.wisdom) / 15) * 62
                      );
                      const fighterDrunk = displayedDrunk(fighter, lastDrink, currentBeerRoll);
                      return `<div class="duelist-column">
@@ -708,8 +1001,9 @@
                    }).join("")}
                  </div>
                  <div class="turn-banner ${isMyTurn || isPendingDrink || canPlayerConfirm || isHost && isWaitingForConfirm ? "" : "waiting"}">
-                   ${isWaitingForConfirm ? match.gamePointId === pendingAdvance.playerId ? `${escapeHtml(playerName(pendingAdvance.playerId))} reached the target — ${escapeHtml(playerName(match.playerIds.find((id) => id !== pendingAdvance.playerId)))} gets one final turn.` : pendingAdvance.outcome === "sobered-up" ? `${escapeHtml(playerName(pendingAdvance.playerId))} sobered up — end the turn.` : match.suddenDeathActive ? `${escapeHtml(playerName(pendingAdvance.playerId))} ${["hit", "bullseye", "sudden-death"].includes(pendingAdvance.outcome) ? "hit" : "did not hit"} in sudden death — end the turn.` : `${escapeHtml(playerName(pendingAdvance.playerId))}'s turn: ${escapeHtml(pendingAdvance.outcome)} — end the turn.` : isPendingDrink ? "Full miss! Drink a beer to finish your turn." : isSuddenDeathDrinkRequired ? "Sudden death: drink a beer before you swing." : activePlayer?.isNpc ? isManualNpcTurn ? `Host controls ${escapeHtml(activePlayer.name)}'s turn` : roomState.npcStepRequired ? `Waiting for host to start ${escapeHtml(activePlayer.name)}'s turn` : roomState.npcStepInProgress ? `${escapeHtml(activePlayer.name)} is lining up a swing…` : `${escapeHtml(activePlayer.name)} is swinging…` : isMyTurn ? "Your turn" : `${escapeHtml(activePlayer?.name || "Player")} is up`}
+                   ${turnBannerMessage}
                  </div>
+                 ${pendingBullseye && !pendingLuckyBullseye ? '<div class="bullseye-announcement" role="status" aria-live="polite"><strong>BULLSEYE!</strong><span>+2 HITS</span></div>' : ""}
                  <div class="meter-scroll">
                    <div class="target-label"><span>Miss</span><span>Bend</span><span>Hit zone</span><span>Bend</span><span>Miss</span></div>
                    <div class="meter-frame ${shownDrunk ? "wobble" : ""}" style="--wiggle:${Math.min(12, 2 + shownDrunk * 2)}px;--wiggle-time:${Math.max(120, 280 - shownDrunk * 30)}ms">
@@ -719,11 +1013,13 @@
                      <div class="bend-risk" style="left:${Math.max(0, targetStart - dangerWidth)}%;width:${dangerWidth}%"></div>
                      <div class="target-zone" style="left:${targetStart}%;width:${width}%"></div>
                      <div class="bend-risk" style="left:${rightDangerStart}%;width:${rightDangerWidth}%"></div>
+                     ${luckyZonesMarkup(shownSwingStats)}
                      ${criticalWidth ? `<div class="bullseye-zone" title="Bullseye: worth two hits" style="left:${50 - criticalWidth / 2}%;width:${criticalWidth}%"></div>` : ""}
                      <div id="needle" class="needle ${isWaitingForConfirm || isPendingDrink ? "held" : ""}" style="${match?.lastSwing ? `left:${match.lastSwing.position}%` : ""}"></div>
                    </div>
                    </div>
                  </div>
+                 ${luckyRollMarkup}
                  ${canControlTurn || canPlayerConfirm ? `<div class="actions">
                    ${canPlayerConfirm
                      ? ""
@@ -749,13 +1045,17 @@
         </section>
       </div>
       <section class="card bracket">
-        <div class="topline"><div><p class="eyebrow">Tournament progress</p><h3>Double-elimination bracket</h3></div><div class="bracket-actions"><span class="status-pill">${roomState.history.length} matches complete</span>${isHost && roomState.phase !== "lobby" ? '<button id="restart-tournament" class="button button-secondary">Restart tournament</button>' : ""}</div></div>
+        <div class="topline"><div><p class="eyebrow">Tournament progress</p><h3>${roomState.tournamentFormat === "single" ? "Single-elimination bracket" : "Double-elimination bracket"}</h3></div><div class="bracket-actions"><span class="status-pill">${roomState.history.length} matches complete</span>${isHost && roomState.phase !== "lobby" ? '<button id="restart-tournament" class="button button-secondary">Restart tournament</button>' : ""}</div></div>
         ${bracket}
       </section>`;
   }
 
   function playerLobbyMarkup() {
     const player = findPlayer(playerId);
+    const otherPlayers = roomState.players.filter((participant) => participant.id !== playerId);
+    const claimableNpcs = player?.connected && !player.isNpc
+      ? roomState.players.filter((participant) => participant.isNpc)
+      : [];
     practiceState ||= {
       hits: 0,
       message: "Practice swings won't affect your stats or tournament.",
@@ -771,21 +1071,43 @@
       constitution: findPlayer(playerId)?.constitution ?? 3,
       stats: randomPracticeStats()
     };
-    return `<section class="card">
-      <h2>You are in</h2>
-      <p class="muted">Waiting for the host to start. You can set your stats until the tournament begins.</p>
-      <p class="help">Participants joined: ${roomState.players.length}/32</p>
-      ${characterImagePicker(player)}
-      <form id="my-stats-form">
-        <div class="stats-grid">
-          ${statSelect(player, "strength", "Strength")}
-          ${statSelect(player, "dexterity", "Dexterity")}
-          ${statSelect(player, "constitution", "Constitution")}
-          ${statSelect(player, "wisdom", "Wisdom")}
-        </div>
-        <button class="button button-secondary" type="submit">Save my stats</button>
-        <p id="player-stats-message" class="toast" role="status"></p>
-      </form>
+    return `<section class="card player-lobby-card">
+      <div class="lobby-waiting-heading">
+        <div><p class="eyebrow">Before the tournament</p><h2>Waiting for the host to start</h2><p class="muted">You can update your character while everyone gets ready.</p></div>
+        <span class="status-pill">Lobby</span>
+      </div>
+      <div class="lobby-character-layout">
+        <section class="your-character-panel" aria-label="Your character">
+          <div class="your-character-heading">
+            <img class="your-character-portrait" src="${characterImageUrl(player.characterImage || "Generic NPC.png")}" alt="">
+            <div class="your-character-info"><p class="eyebrow">You are playing as</p><h3>${escapeHtml(player.name)}</h3><span class="status-pill">Your character</span></div>
+            ${characterImagePicker(player)}
+          </div>
+          <form id="my-stats-form" class="your-character-stats">
+            <h4>Your stats</h4>
+            <div class="stats-grid">
+              ${statSelect(player, "strength", "Strength")}
+              ${statSelect(player, "dexterity", "Dexterity")}
+              ${statSelect(player, "constitution", "Constitution")}
+              ${statSelect(player, "wisdom", "Wisdom")}
+            </div>
+            <button class="button button-secondary" type="submit">Save my stats</button>
+            <p id="player-stats-message" class="toast" role="status"></p>
+          </form>
+        </section>
+        <section class="other-participants-panel" aria-label="Other players and NPCs">
+          <h3>Other players &amp; NPCs <span class="participant-count">${otherPlayers.length}</span></h3>
+          ${otherPlayers.length ? `<div class="lobby-participant-list">${otherPlayers.map((participant) => `
+            <div class="lobby-participant">
+              <img src="${characterImageUrl(participant.characterImage || "Generic NPC.png")}" alt="">
+              <div><strong>${escapeHtml(participant.name)}</strong><span>${participant.isNpc ? "NPC" : participant.connected === false ? "Disconnected" : "Player"} · STR ${participant.strength} · DEX ${participant.dexterity} · CON ${participant.constitution} · WIS ${participant.wisdom}</span></div>
+            </div>`).join("")}</div>` : '<p class="muted no-other-participants">You are the first player in the room. Others will appear here when they join.</p>'}
+        </section>
+      </div>
+      <p class="help lobby-player-count">Participants joined: ${roomState.players.length}/32</p>
+      ${claimableNpcs.length ? `<section class="claim-characters"><h3>Claim a Character</h3><p class="help">Your current character will become an NPC, and you will play using the claimed character's name and stats.</p><div class="claim-character-list">${claimableNpcs.map((npc) =>
+        `<button type="button" class="claim-character" data-claim-character="${escapeHtml(npc.id)}"><img src="${characterImageUrl(npc.characterImage || "Generic NPC.png")}" alt=""><span><strong>${escapeHtml(npc.name)}</strong><small>STR ${npc.strength} · DEX ${npc.dexterity} · CON ${npc.constitution} · WIS ${npc.wisdom}</small></span></button>`
+      ).join("")}</div></section>` : ""}
       ${practiceMarkup()}
     </section>`;
   }
@@ -822,6 +1144,7 @@
           <div class="bend-risk" style="left:${Math.max(0, targetStart - dangerWidth)}%;width:${dangerWidth}%"></div>
           <div class="target-zone" style="left:${targetStart}%;width:${stats.width}%"></div>
           <div class="bend-risk" style="left:${rightDangerStart}%;width:${rightDangerWidth}%"></div>
+          ${luckyZonesMarkup(stats)}
           ${stats.criticalWidth ? `<div class="bullseye-zone" style="left:${50 - stats.criticalWidth / 2}%;width:${stats.criticalWidth}%"></div>` : ""}
           <div id="practice-needle" class="needle" style="left:${practiceState.position}%"></div>
           </div>
@@ -829,7 +1152,7 @@
       </div>
       <div class="practice-controls">${practiceState.pendingDrink
         ? `<button id="practice-drink" class="button button-primary" ${practiceState.rollingBeer ? "disabled" : ""}>${practiceState.rollingBeer ? "Rolling d20…" : "Drink a Beer · roll d20"}</button>${practiceState.beerRoll !== null ? `<span class="practice-roll beer-die ${practiceState.rollingBeer ? "rolling" : ""}">${renderD20(practiceState.beerRoll)}</span>` : ""}`
-        : `<button id="practice-swing" class="button button-primary">Swing <span class="key">SPACE BAR</span></button>${practiceState.bent ? '<button id="practice-straighten" class="button button-secondary">Straighten nail · uses turn</button>' : ""}${practiceState.drunk ? '<button id="practice-sober-up" class="button button-secondary">Sober Up · uses turn</button>' : ""}`}
+        : `<button id="practice-swing" class="button button-primary" ${practiceState.rollingLucky ? "disabled" : ""}>${practiceState.rollingLucky ? "Rolling lucky bullseye…" : 'Swing <span class="key">SPACE BAR</span>'}</button>${practiceState.rollingLucky ? `<span class="practice-roll beer-die practice-lucky-die rolling">${renderD20(practiceState.luckyRoll)}</span>` : ""}${practiceState.bent ? '<button id="practice-straighten" class="button button-secondary">Straighten nail · uses turn</button>' : ""}${practiceState.drunk ? '<button id="practice-sober-up" class="button button-secondary">Sober Up · uses turn</button>' : ""}`}
         <strong id="practice-score">${practiceState.hits} hits</strong><button id="practice-reset" class="button button-secondary">Reset beers / intoxication</button></div>
       <p id="practice-message" class="toast" role="status">${escapeHtml(practiceState.message)}</p>
     </section>`;
@@ -896,14 +1219,19 @@
 
   function bindPracticeControls() {
     document.querySelector("#practice-swing")?.addEventListener("click", () => {
+      if (practiceState.rollingLucky) return;
       if (practiceFrame) cancelAnimationFrame(practiceFrame);
       const stats = calculateSwingStats(practiceState.stats, practiceState.bent, practiceState.bonus);
       const distance = Math.abs(practiceState.position - 50);
       const result = stats.criticalWidth > 0 && distance <= stats.criticalWidth / 2 ? "bullseye"
+        : stats.luckyWidth > 0 && distance <= (stats.criticalWidth + stats.luckyWidth) / 2 ? "lucky"
         : distance <= stats.width / 2 ? "hit"
           : distance <= stats.width / 2 + stats.bendWidth ? "bent"
             : "miss";
-      if (result === "bullseye") {
+      if (result === "lucky") {
+        startPracticeLuckyRoll();
+        return;
+      } else if (result === "bullseye") {
         practiceState.hits += 2;
         practiceState.message = "Bullseye! Two practice hits.";
         playSound("hit");
@@ -989,6 +1317,38 @@
     startPracticeMeter();
   }
 
+  function startPracticeLuckyRoll() {
+    const roll = Math.floor(Math.random() * 20) + 1;
+    practiceState.rollingLucky = true;
+    practiceState.luckyRoll = Math.floor(Math.random() * 20) + 1;
+    practiceState.message = "Lucky zone! Rolling d20…";
+    playSound("dice");
+    clearInterval(practiceLuckyInterval);
+    clearTimeout(practiceLuckyTimeout);
+    repaintPractice();
+    practiceLuckyInterval = setInterval(() => {
+      practiceState.luckyRoll = Math.floor(Math.random() * 20) + 1;
+      const face = document.querySelector(".practice-lucky-die b");
+      if (face) face.textContent = practiceState.luckyRoll;
+    }, 80);
+    practiceLuckyTimeout = setTimeout(() => {
+      clearInterval(practiceLuckyInterval);
+      practiceState.rollingLucky = false;
+      if (roll === 20) {
+        practiceState.hits += 2;
+        practiceState.message = `${findPlayer(playerId)?.name || "Player"} got a Lucky Bullseye!`;
+      } else {
+        practiceState.hits += 1;
+        practiceState.message = `Lucky roll ${roll} — regular practice hit.`;
+      }
+      practiceState.bonus = false;
+      practiceState.luckyRoll = roll;
+      practiceState.stats = randomPracticeStats();
+      playSound("hit");
+      repaintPractice();
+    }, 1600);
+  }
+
   function render() {
     if (!roomState) return;
     if (role === "host") {
@@ -996,6 +1356,11 @@
       hostView.classList.remove("hidden");
       playerView.classList.add("hidden");
       bindHostControls();
+    } else if (role === "guest") {
+      playerView.innerHTML = guestMarkup();
+      playerView.classList.remove("hidden");
+      hostView.classList.add("hidden");
+      bindGuestControls();
     } else {
       playerView.innerHTML = `
         <div class="view">
@@ -1074,6 +1439,7 @@
   }
 
   function bindHostControls() {
+    document.querySelector("#download-backup")?.addEventListener("click", downloadTournamentBackup);
     if (roomState.currentMatch) startMeter();
     document.querySelector("#current-best-of")?.addEventListener("change", async (event) => {
       const response = await emitWithCallback("host:set-match-best-of", {
@@ -1183,6 +1549,43 @@
       const error = document.querySelector("#host-error");
       if (error) error.textContent = response?.ok ? "" : response?.error || "Could not add the NPC.";
     });
+    document.querySelectorAll("[data-remove-npc]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const response = await emitWithCallback("host:remove-npc", {
+          code: roomCode,
+          npcId: button.dataset.removeNpc
+        });
+        if (!response?.ok) showToast(response?.error || "Could not remove this NPC.");
+      });
+    });
+    document.querySelectorAll("[data-remove-participant]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const response = await emitWithCallback("host:remove-participant", {
+          code: roomCode,
+          playerId: button.dataset.removeParticipant
+        });
+        if (!response?.ok) showToast(response?.error || "Could not remove this participant.");
+      });
+    });
+    document.querySelectorAll("[data-player-name-form]").forEach((form) => {
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const name = new FormData(form).get("name");
+        const response = await emitWithCallback("host:update-setup", {
+          code: roomCode,
+          updates: [{ id: form.dataset.playerNameForm, name }]
+        });
+        const error = document.querySelector("#host-error");
+        if (error) error.textContent = response?.ok ? "" : response?.error || "Could not update this character's name.";
+      });
+    });
+    document.querySelector("#tournament-format")?.addEventListener("change", async (event) => {
+      const response = await emitWithCallback("host:update-setup", {
+        code: roomCode,
+        tournamentFormat: event.currentTarget.value
+      });
+      if (!response?.ok) showToast(response?.error || "Could not change tournament format.");
+    });
     document.querySelector("#npc-match-mode")?.addEventListener("change", (event) => {
       socket.emit("host:update-setup", { code: roomCode, npcMatchMode: event.target.value });
     });
@@ -1204,6 +1607,17 @@
         if (!response?.ok) showToast(response?.error || "Could not update this character image.");
       });
     });
+    document.querySelectorAll("[data-participant-type]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const participant = findPlayer(button.dataset.participantType);
+        const response = await emitWithCallback("host:set-participant-type", {
+          code: roomCode,
+          playerId: button.dataset.participantType,
+          isNpc: !participant?.isNpc
+        });
+        if (!response?.ok) showToast(response?.error || "Could not change this participant type.");
+      });
+    });
     document.querySelectorAll("[data-stat]").forEach((select) => {
       select.addEventListener("change", () => {
         const update = {
@@ -1213,43 +1627,92 @@
         socket.emit("host:update-setup", { code: roomCode, updates: [update] });
       });
     });
-    document.querySelectorAll("[data-move]").forEach((button) => {
-      button.addEventListener("click", () => {
-        const from = Number(button.closest(".participant-row").querySelector(".seed").textContent.slice(1)) - 1;
-        const to = Number(button.dataset.move);
-        const players = [...roomState.players];
-        [players[from], players[to]] = [players[to], players[from]];
-        socket.emit("host:update-setup", { code: roomCode, order: players.map((player) => player.id) });
+    const submitLobbyMatchupUpdate = (payload) => {
+      socket.emit("host:update-setup", { code: roomCode, ...payload }, (response) => {
+        const error = document.querySelector("#host-error");
+        if (error) error.textContent = response?.ok ? "" : response?.error || "Could not update the first-round matchups.";
       });
-    });
-    let draggedId = null;
-    document.querySelectorAll(".draggable-participant").forEach((row) => {
-      row.addEventListener("dragstart", (event) => {
-        draggedId = row.dataset.playerId;
-        row.classList.add("dragging");
-        event.dataTransfer.effectAllowed = "move";
-        event.dataTransfer.setData("text/plain", draggedId);
+    };
+    const reorderParticipant = (sourceId, targetIndex) => {
+      const players = [...roomState.players];
+      const sourceIndex = players.findIndex((player) => player.id === sourceId);
+      if (sourceIndex < 0 || targetIndex < 0 || targetIndex >= players.length || sourceIndex === targetIndex) return;
+      const [dragged] = players.splice(sourceIndex, 1);
+      players.splice(targetIndex, 0, dragged);
+      submitLobbyMatchupUpdate({ order: players.map((player) => player.id) });
+    };
+    const assignBye = (sourceId) => {
+      const matchups = roomState.firstRoundMatchups
+        ? roomState.firstRoundMatchups.map((matchup) => [...matchup])
+        : roomState.players.reduce((slots, player, index, players) => {
+          if (index % 2 === 0) slots.push([player.id, players[index + 1]?.id || null]);
+          return slots;
+        }, []);
+      const sourceMatchup = matchups.find((matchup) => matchup.includes(sourceId));
+      const byeMatchup = matchups.find((matchup) => matchup.includes(null));
+      if (!sourceMatchup || !byeMatchup) return;
+      const sourceSlot = sourceMatchup.indexOf(sourceId);
+      const byeSlot = byeMatchup.indexOf(null);
+      [sourceMatchup[sourceSlot], byeMatchup[byeSlot]] = [byeMatchup[byeSlot], sourceMatchup[sourceSlot]];
+      submitLobbyMatchupUpdate({ firstRoundMatchups: matchups });
+    };
+    const clearLobbyDragState = () => {
+      hostView.querySelectorAll(".dragging, .drop-target").forEach((element) => {
+        element.classList.remove("dragging", "drop-target");
       });
-      row.addEventListener("dragend", () => row.classList.remove("dragging", "drop-target"));
-      row.addEventListener("dragover", (event) => {
-        event.preventDefault();
-        event.dataTransfer.dropEffect = "move";
-        row.classList.add("drop-target");
-      });
-      row.addEventListener("dragleave", () => row.classList.remove("drop-target"));
-      row.addEventListener("drop", (event) => {
-        event.preventDefault();
-        row.classList.remove("drop-target");
-        const sourceId = draggedId || event.dataTransfer.getData("text/plain");
-        const players = [...roomState.players];
-        const sourceIndex = players.findIndex((player) => player.id === sourceId);
-        const targetIndex = players.findIndex((player) => player.id === row.dataset.playerId);
-        if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return;
-        const [dragged] = players.splice(sourceIndex, 1);
-        players.splice(targetIndex, 0, dragged);
-        socket.emit("host:update-setup", { code: roomCode, order: players.map((player) => player.id) });
-      });
-    });
+      draggedLobbyParticipantId = null;
+      draggedLobbyPointerY = null;
+    };
+    hostView.onpointerdown = (event) => {
+      const handle = event.target instanceof Element ? event.target.closest("[data-drag-player]") : null;
+      if (!handle) return;
+      event.preventDefault();
+      draggedLobbyParticipantId = handle.dataset.dragPlayer;
+      draggedLobbyPointerY = event.clientY;
+      handle.closest(".first-round-player-card")?.classList.add("dragging");
+    };
+    hostView.onpointermove = (event) => {
+      if (!draggedLobbyParticipantId) return;
+      const edgeSize = 32;
+      if (event.clientY < edgeSize && event.clientY <= draggedLobbyPointerY) window.scrollBy(0, -18);
+      else if (event.clientY > window.innerHeight - edgeSize && event.clientY >= draggedLobbyPointerY) window.scrollBy(0, 18);
+      draggedLobbyPointerY = event.clientY;
+      const target = document.elementFromPoint(event.clientX, event.clientY);
+      hostView.querySelectorAll(".drop-target").forEach((element) => element.classList.remove("drop-target"));
+      target?.closest("[data-bye-slot], .first-round-player-card")?.classList.add("drop-target");
+    };
+    hostView.onpointerup = (event) => {
+      if (!draggedLobbyParticipantId) return;
+      const sourceId = draggedLobbyParticipantId;
+      const target = document.elementFromPoint(event.clientX, event.clientY);
+      const byeSlot = target?.closest("[data-bye-slot]");
+      const targetCard = target?.closest(".first-round-player-card");
+      if (byeSlot) {
+        assignBye(sourceId);
+      } else if (targetCard && targetCard.dataset.playerId !== sourceId) {
+        const targetIndex = roomState.players.findIndex((player) => player.id === targetCard.dataset.playerId);
+        reorderParticipant(sourceId, targetIndex);
+      }
+      clearLobbyDragState();
+    };
+    hostView.onpointercancel = clearLobbyDragState;
+    hostView.onclick = (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      const handle = target?.closest("[data-drag-player]");
+      if (handle) {
+        hostView.querySelectorAll(".selected-for-bye").forEach((element) => element.classList.remove("selected-for-bye"));
+        selectedLobbyParticipantId = selectedLobbyParticipantId === handle.dataset.dragPlayer
+          ? null
+          : handle.dataset.dragPlayer;
+        if (selectedLobbyParticipantId) handle.closest(".first-round-player-card")?.classList.add("selected-for-bye");
+        return;
+      }
+      if (target?.closest("[data-bye-slot]") && selectedLobbyParticipantId) {
+        assignBye(selectedLobbyParticipantId);
+        selectedLobbyParticipantId = null;
+        hostView.querySelectorAll(".selected-for-bye").forEach((element) => element.classList.remove("selected-for-bye"));
+      }
+    };
   }
 
   function bindPlayerControls() {
@@ -1289,6 +1752,21 @@
           characterImage: button.dataset.characterImage
         });
         if (!response?.ok) showToast(response?.error || "Could not update your character image.");
+      });
+    });
+    document.querySelectorAll("[data-claim-character]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const response = await emitWithCallback("player:claim-character", {
+          code: roomCode,
+          npcId: button.dataset.claimCharacter
+        });
+        if (!response?.ok) {
+          showToast(response?.error || "Could not claim that character.");
+          return;
+        }
+        playerId = response.playerId;
+        saveLastPlayer(roomCode, response.name);
+        render();
       });
     });
     document.querySelector("#my-stats-form")?.addEventListener("submit", async (event) => {
@@ -1454,15 +1932,25 @@
   document.querySelector("#create-room").addEventListener("click", createRoom);
   document.querySelector("#join-form").addEventListener("submit", joinRoom);
   document.querySelector("#room-code").addEventListener("input", updateRejoinButton);
+  document.querySelector("#player-name").addEventListener("input", updateRejoinButton);
   document.querySelector("#rejoin-game").addEventListener("click", () => {
     const code = document.querySelector("#room-code").value;
-    const saved = savedReconnect(code);
-    if (saved) rejoinRoom(code, saved.token);
+    const name = document.querySelector("#player-name").value.trim();
+    rejoinRoom(code, name);
   });
+  document.querySelector("#backup-file").addEventListener("change", (event) => {
+    selectedBackupFile = event.currentTarget.files?.[0] || null;
+    document.querySelector("#restore-backup").disabled = !selectedBackupFile;
+  });
+  document.querySelector("#restore-backup").addEventListener("click", restoreTournamentBackup);
   try {
-    document.querySelector("#room-code").value = localStorage.getItem("hammerschlagen-last-room") || "";
+    const previousPlayer = JSON.parse(localStorage.getItem("hammerschlagen-last-player") || "null");
+    if (typeof previousPlayer?.code === "string" && typeof previousPlayer?.name === "string") {
+      document.querySelector("#room-code").value = previousPlayer.code;
+      document.querySelector("#player-name").value = previousPlayer.name;
+    }
   } catch {
-    showError("Browser storage is unavailable, so saved rejoin is disabled.");
+    showError("Browser storage is unavailable; enter your room code and player name to rejoin.");
   }
   updateRejoinButton();
   document.addEventListener("keydown", (event) => {
@@ -1516,11 +2004,46 @@
     roomState = state;
     render();
   });
+  socket.on("participant:switched-to-npc", ({ code, name } = {}) => {
+    if (role !== "player" || code !== roomCode) return;
+    role = null;
+    roomCode = null;
+    playerId = null;
+    roomState = null;
+    hostView.classList.add("hidden");
+    playerView.classList.add("hidden");
+    landing.classList.remove("hidden");
+    showError(`${name || "Your character"} was switched to an NPC by the host. You can rejoin if the host switches them back to a player.`);
+  });
+  socket.on("participant:removed", ({ code, name } = {}) => {
+    if (role !== "player" || code !== roomCode) return;
+    let message = `${name || "Your character"} was removed from the room by the host. Re-enter the room code if you want to join again.`;
+    try {
+      localStorage.removeItem("hammerschlagen-last-player");
+    } catch {
+      message += " This browser could not clear the saved rejoin details.";
+    }
+    role = null;
+    roomCode = null;
+    playerId = null;
+    roomState = null;
+    document.querySelector("#player-name").value = "";
+    updateRejoinButton();
+    hostView.classList.add("hidden");
+    playerView.classList.add("hidden");
+    landing.classList.remove("hidden");
+    showError(message);
+  });
   socket.on("connect", () => {
-    if (role === "player" && roomCode && reconnectToken) rejoinRoom();
+    if (role === "player" && roomCode && playerId) rejoinRoom(roomCode, playerName(playerId));
+    else if (role === "guest" && roomCode) reenterRoom(roomCode);
   });
   socket.on("disconnect", () => {
     if (role === "player") showToast("Disconnected. Reconnecting to the room…");
+    else if (role === "guest") {
+      const error = document.querySelector("#guest-error");
+      if (error) error.textContent = "Disconnected. Reconnecting to the room…";
+    }
   });
   socket.on("connect_error", () => {
     if (role === "player") showToast("Lost connection to the game server. Rejoining is available when it reconnects.");

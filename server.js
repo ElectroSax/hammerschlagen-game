@@ -2,7 +2,7 @@ const express = require("express");
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
-const { createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } = require("node:crypto");
+const { randomInt, randomUUID } = require("node:crypto");
 const { Server } = require("socket.io");
 const {
   MAX_PLAYERS,
@@ -14,6 +14,8 @@ const {
   applyHostNpcAction,
   applyNpcTurn,
   awardMatchToWinner,
+  claimNpcCharacter,
+  createBackup,
   createPlayer,
   createRoom,
   confirmTurn,
@@ -23,8 +25,10 @@ const {
   randomizeBracket,
   resolveCurrentMatch,
   restartCurrentMatch,
+  restoreBackup,
   setMatchBestOf,
   setMatchHitsToWin,
+  setParticipantNpcStatus,
   setPlayerStats,
   seedTournament,
   startNextMatch
@@ -35,6 +39,7 @@ const httpServer = http.createServer(app);
 const io = new Server(httpServer);
 const rooms = new Map();
 const npcTimers = new Map();
+const pendingGuests = new Map();
 const assetsDirectory = path.join(__dirname, "public", "assets");
 const characterImages = fs.readdirSync(assetsDirectory)
   .filter((file) => /\.(png|jpe?g|webp|gif)$/i.test(file))
@@ -48,7 +53,20 @@ app.use(express.static(path.join(__dirname, "public")));
 app.get("/health", (_request, response) => response.json({ ok: true }));
 
 function roomState(room) {
-  return { ...publicState(room), characterImages };
+  return {
+    ...publicState(room),
+    characterImages,
+    pendingPlayerCount: pendingGuestSockets(room).size
+  };
+}
+
+function pendingGuestSockets(room) {
+  let guests = pendingGuests.get(room.code);
+  if (!guests) {
+    guests = new Set();
+    pendingGuests.set(room.code, guests);
+  }
+  return guests;
 }
 
 function broadcast(room) {
@@ -59,19 +77,43 @@ function hostOnly(socket, room) {
   return room && room.hostId === socket.id;
 }
 
+function validFirstRoundMatchups(matchups, players) {
+  const playerIds = new Set(players.map((player) => player.id));
+  const flattened = Array.isArray(matchups) ? matchups.flat() : [];
+  return Array.isArray(matchups) &&
+    matchups.length === Math.ceil(players.length / 2) &&
+    matchups.every((matchup) =>
+      Array.isArray(matchup) &&
+      matchup.length === 2 &&
+      matchup.every((id) => id === null || typeof id === "string" && playerIds.has(id)) &&
+      !(matchup[0] === null && matchup[1] === null)
+    ) &&
+    flattened.filter((id) => id === null).length === players.length % 2 &&
+    flattened.filter((id) => id !== null).length === playerIds.size &&
+    new Set(flattened.filter((id) => id !== null)).size === playerIds.size;
+}
+
+function removeLobbyParticipant(room, participantId) {
+  const index = room.players.findIndex((player) => player.id === participantId);
+  if (index < 0) return false;
+  const [participant] = room.players.splice(index, 1);
+  room.firstRoundMatchups = null;
+  if (!participant.isNpc && participant.socketId) {
+    const participantSocket = io.sockets.sockets.get(participant.socketId);
+    if (participantSocket) {
+      participantSocket.emit("participant:removed", { code: room.code, name: participant.name });
+      participantSocket.leave(room.code);
+      participantSocket.data.playerId = null;
+      delete participantSocket.data.roomCode;
+    }
+  }
+  return true;
+}
+
 function playerForSocket(room, socket) {
   if (!room || socket.data.roomCode !== room.code || !socket.data.playerId) return null;
   const player = room.players.find((entry) => entry.id === socket.data.playerId);
   return player?.socketId === socket.id ? player : null;
-}
-
-function hashReconnectToken(token) {
-  return createHash("sha256").update(token).digest();
-}
-
-function reconnectTokenMatches(player, token) {
-  if (typeof token !== "string" || !player?.reconnectTokenHash) return false;
-  return timingSafeEqual(hashReconnectToken(token), Buffer.from(player.reconnectTokenHash, "hex"));
 }
 
 function hasNpcOnlyMatch(room) {
@@ -174,12 +216,68 @@ io.on("connection", (socket) => {
     callback?.({ ok: true, state: roomState(room) });
   });
 
-  socket.on("player:join", ({ code, name, stats } = {}, callback) => {
+  socket.on("host:backup", ({ code } = {}, callback) => {
+    const room = rooms.get(typeof code === "string" ? code : "");
+    if (!hostOnly(socket, room)) {
+      callback?.({ ok: false, error: "Only the host can export a tournament backup." });
+      return;
+    }
+    callback?.({ ok: true, backup: createBackup(room) });
+  });
+
+  socket.on("host:restore", ({ backup } = {}, callback) => {
+    let code;
+    do {
+      code = makeRoomCode();
+    } while (rooms.has(code));
+    const restored = restoreBackup(backup, socket.id, code);
+    if (!restored.ok) {
+      callback?.(restored);
+      return;
+    }
+    const room = restored.room;
+    rooms.set(code, room);
+    socket.join(code);
+    callback?.({ ok: true, state: roomState(room) });
+    broadcast(room);
+    scheduleNpcTurn(room);
+  });
+
+  socket.on("player:enter-room", ({ code } = {}, callback) => {
     const normalizedCode = typeof code === "string" ? code.trim().toUpperCase() : "";
-    const normalizedName = validName(name);
     const room = rooms.get(normalizedCode);
     if (!room) {
       callback?.({ ok: false, error: "Room not found. Check the code with your host." });
+      return;
+    }
+    if (room.phase !== "lobby") {
+      callback?.({ ok: false, error: "This tournament has already started." });
+      return;
+    }
+    if (socket.data.playerId || playerForSocket(room, socket)) {
+      callback?.({ ok: false, error: "This connection already has a player profile." });
+      return;
+    }
+    const guests = pendingGuestSockets(room);
+    if (!guests.has(socket.id) && room.players.length + guests.size >= MAX_PLAYERS) {
+      callback?.({ ok: false, error: `This room already has ${MAX_PLAYERS} participants.` });
+      return;
+    }
+    guests.add(socket.id);
+    socket.join(room.code);
+    socket.data.roomCode = room.code;
+    delete socket.data.playerId;
+    callback?.({ ok: true, state: roomState(room) });
+    broadcast(room);
+  });
+
+  socket.on("player:create-profile", ({ code, name, stats } = {}, callback) => {
+    const normalizedCode = typeof code === "string" ? code.trim().toUpperCase() : "";
+    const normalizedName = validName(name);
+    const room = rooms.get(normalizedCode);
+    const guests = room ? pendingGuestSockets(room) : null;
+    if (!room || socket.data.roomCode !== room.code || !guests?.has(socket.id)) {
+      callback?.({ ok: false, error: "Enter the room before creating a player profile." });
       return;
     }
     if (room.phase !== "lobby") {
@@ -205,32 +303,63 @@ io.on("connection", (socket) => {
 
     const player = createPlayer(socket.id, normalizedName);
     setPlayerStats(player, stats);
-    const reconnectToken = randomBytes(32).toString("base64url");
-    player.reconnectTokenHash = hashReconnectToken(reconnectToken).toString("hex");
     player.socketId = socket.id;
     player.connected = true;
     room.players.push(player);
-    socket.join(room.code);
-    socket.data.roomCode = room.code;
+    room.firstRoundMatchups = null;
     socket.data.playerId = player.id;
-    callback?.({ ok: true, state: roomState(room), playerId: player.id, reconnectToken });
+    guests.delete(socket.id);
+    callback?.({ ok: true, state: roomState(room), playerId: player.id });
     broadcast(room);
   });
 
-  socket.on("player:rejoin", ({ code, reconnectToken } = {}, callback) => {
+  socket.on("player:claim-npc", ({ code, npcId } = {}, callback) => {
     const normalizedCode = typeof code === "string" ? code.trim().toUpperCase() : "";
+    const room = rooms.get(normalizedCode);
+    const guests = room ? pendingGuestSockets(room) : null;
+    if (!room || socket.data.roomCode !== room.code || !guests?.has(socket.id)) {
+      callback?.({ ok: false, error: "Enter the room before claiming an NPC." });
+      return;
+    }
+    if (room.phase !== "lobby") {
+      callback?.({ ok: false, error: "NPCs can only be claimed before the tournament starts." });
+      return;
+    }
+    const npc = room.players.find((player) => player.id === npcId && player.isNpc);
+    if (!npc) {
+      callback?.({ ok: false, error: "That NPC is no longer available to claim." });
+      return;
+    }
+    npc.isNpc = false;
+    npc.socketId = socket.id;
+    npc.connected = true;
+    socket.data.playerId = npcId;
+    guests.delete(socket.id);
+    callback?.({ ok: true, state: roomState(room), playerId: npcId, name: npc.name });
+    broadcast(room);
+  });
+
+  socket.on("player:rejoin", ({ code, name } = {}, callback) => {
+    const normalizedCode = typeof code === "string" ? code.trim().toUpperCase() : "";
+    const normalizedName = validName(name);
     const room = rooms.get(normalizedCode);
     if (!room) {
       callback?.({ ok: false, error: "Room not found. Check the code with your host." });
       return;
     }
-    const player = room.players.find((entry) => reconnectTokenMatches(entry, reconnectToken));
+    if (!normalizedName) {
+      callback?.({ ok: false, error: "Enter the participant name used to join this room." });
+      return;
+    }
+    const player = room.players.find((entry) =>
+      !entry.isNpc && entry.name.toLowerCase() === normalizedName.toLowerCase()
+    );
     if (!player) {
-      callback?.({ ok: false, error: "No participant matches this saved reconnect token." });
+      callback?.({ ok: false, error: "No player with that name was found in this room." });
       return;
     }
     if (player.connected && player.socketId && io.sockets.sockets.has(player.socketId)) {
-      callback?.({ ok: false, error: "This participant is already connected." });
+      callback?.({ ok: false, error: "That player is already connected to the room." });
       return;
     }
     player.socketId = socket.id;
@@ -252,7 +381,7 @@ io.on("connection", (socket) => {
       callback?.({ ok: false, error: "Add at least one NPC line." });
       return;
     }
-    if (room.players.length + entries.length > MAX_PLAYERS) {
+    if (room.players.length + pendingGuestSockets(room).size + entries.length > MAX_PLAYERS) {
       callback?.({ ok: false, error: `A tournament can have at most ${MAX_PLAYERS} participants.` });
       return;
     }
@@ -278,39 +407,110 @@ io.on("connection", (socket) => {
       setPlayerStats(npc, stats);
       room.players.push(npc);
     });
+    room.firstRoundMatchups = null;
     callback?.({ ok: true });
     broadcast(room);
   });
 
-  socket.on("host:update-setup", ({ code, order, updates, npcMatchMode, hitsToWin, bestOf, skipNpcOnly } = {}, callback) => {
+  socket.on("host:remove-npc", ({ code, npcId } = {}, callback) => {
+    const room = rooms.get(typeof code === "string" ? code : "");
+    if (!hostOnly(socket, room) || room.phase !== "lobby") {
+      callback?.({ ok: false, error: "Only the host can remove NPCs before the tournament starts." });
+      return;
+    }
+    const npcIndex = room.players.findIndex((player) => player.id === npcId && player.isNpc);
+    if (npcIndex < 0) {
+      callback?.({ ok: false, error: "That NPC is no longer available to remove." });
+      return;
+    }
+    room.players.splice(npcIndex, 1);
+    callback?.({ ok: true });
+    broadcast(room);
+  });
+
+  socket.on("host:remove-participant", ({ code, playerId } = {}, callback) => {
+    const room = rooms.get(typeof code === "string" ? code : "");
+    if (!hostOnly(socket, room) || room.phase !== "lobby") {
+      callback?.({ ok: false, error: "Only the host can remove participants before the tournament starts." });
+      return;
+    }
+    if (!removeLobbyParticipant(room, playerId)) {
+      callback?.({ ok: false, error: "That participant is no longer available to remove." });
+      return;
+    }
+    callback?.({ ok: true });
+    broadcast(room);
+  });
+
+  socket.on("host:update-setup", ({ code, order, updates, firstRoundMatchups, npcMatchMode, hitsToWin, bestOf, skipNpcOnly, tournamentFormat } = {}, callback) => {
     const room = rooms.get(typeof code === "string" ? code : "");
     if (!hostOnly(socket, room)) {
       callback?.({ ok: false, error: "Only the host can change tournament setup." });
       return;
     }
+    if (firstRoundMatchups !== undefined &&
+        (room.phase !== "lobby" || !validFirstRoundMatchups(firstRoundMatchups, room.players))) {
+      callback?.({ ok: false, error: "The first-round matchups must include every participant exactly once and one bye for an odd-sized bracket." });
+      return;
+    }
     const imageUpdates = Array.isArray(updates)
       ? updates.filter((update) => update?.characterImage !== undefined)
       : [];
-    if (imageUpdates.length && room.phase !== "lobby") {
-      callback?.({ ok: false, error: "Character images can only be changed before the tournament starts." });
-      return;
-    }
     if (imageUpdates.some((update) => !characterImages.includes(update.characterImage))) {
       callback?.({ ok: false, error: "Choose a character image from the available images." });
       return;
+    }
+    const nameUpdates = Array.isArray(updates)
+      ? updates.filter((update) => update?.name !== undefined)
+      : [];
+    if (nameUpdates.length) {
+      if (room.phase !== "lobby") {
+        callback?.({ ok: false, error: "Participant names can only be changed before the tournament starts." });
+        return;
+      }
+      const namesById = new Map();
+      for (const update of nameUpdates) {
+        const name = validName(update.name);
+        if (!room.players.some((player) => player.id === update.id) || !name) {
+          callback?.({ ok: false, error: "Choose a participant and enter a valid name." });
+          return;
+        }
+        namesById.set(update.id, name);
+      }
+      const finalNames = room.players.map((player) =>
+        (namesById.get(player.id) || player.name).toLowerCase()
+      );
+      if (new Set(finalNames).size !== finalNames.length) {
+        callback?.({ ok: false, error: "Participant names must be unique within the room." });
+        return;
+      }
+    }
+    if (tournamentFormat !== undefined) {
+      if (room.phase !== "lobby" || !["single", "double"].includes(tournamentFormat)) {
+        callback?.({ ok: false, error: "Choose single or double elimination before the tournament starts." });
+        return;
+      }
+      room.tournamentFormat = tournamentFormat;
     }
 
     if (room.phase === "lobby" && Array.isArray(order) && order.length === room.players.length) {
       const orderSet = new Set(order);
       if (orderSet.size === room.players.length && room.players.every((player) => orderSet.has(player.id))) {
         room.players.sort((left, right) => order.indexOf(left.id) - order.indexOf(right.id));
+        room.firstRoundMatchups = null;
       }
+    }
+    if (firstRoundMatchups !== undefined) {
+      room.firstRoundMatchups = firstRoundMatchups.map((matchup) => [...matchup]);
     }
 
     if (Array.isArray(updates)) {
       updates.forEach((update) => {
         const player = room.players.find((entry) => entry.id === update?.id);
         if (!player) return;
+        if (update.name !== undefined && room.phase === "lobby") {
+          player.name = validName(update.name);
+        }
         for (const stat of ["strength", "dexterity", "constitution", "wisdom"]) {
           const value = boundedStat(update[stat]);
           if (value === null) continue;
@@ -463,6 +663,62 @@ io.on("connection", (socket) => {
     broadcast(room);
   });
 
+  socket.on("player:claim-character", ({ code, npcId } = {}, callback) => {
+    const room = rooms.get(typeof code === "string" ? code : "");
+    const player = playerForSocket(room, socket);
+    if (!room || room.phase !== "lobby" || !player || player.isNpc) {
+      callback?.({ ok: false, error: "Only a joined player can claim a character before the tournament starts." });
+      return;
+    }
+    if (!claimNpcCharacter(room, player.id, npcId)) {
+      callback?.({ ok: false, error: "That NPC is no longer available to claim." });
+      return;
+    }
+    const claimedNpc = room.players.find((participant) => participant.id === npcId);
+    socket.data.playerId = npcId;
+    callback?.({ ok: true, name: claimedNpc.name, playerId: npcId });
+    broadcast(room);
+  });
+
+  socket.on("host:set-participant-type", ({ code, playerId, isNpc } = {}, callback) => {
+    const room = rooms.get(typeof code === "string" ? code : "");
+    if (!hostOnly(socket, room)) {
+      callback?.({ ok: false, error: "Only the host can change participant types." });
+      return;
+    }
+    const player = room.players.find((entry) => entry.id === playerId);
+    if (!player || typeof isNpc !== "boolean") {
+      callback?.({ ok: false, error: "Choose a participant and a valid participant type." });
+      return;
+    }
+    if (player.isNpc === isNpc) {
+      callback?.({ ok: true });
+      return;
+    }
+
+    clearNpcTimer(room);
+    if (isNpc) {
+      const participantSocket = player.socketId && io.sockets.sockets.get(player.socketId);
+      if (participantSocket) {
+        participantSocket.data.playerId = null;
+        participantSocket.leave(room.code);
+        participantSocket.emit("participant:switched-to-npc", {
+          code: room.code,
+          name: player.name
+        });
+      }
+      player.socketId = null;
+      player.connected = false;
+    } else {
+      player.socketId = null;
+      player.connected = false;
+    }
+    setParticipantNpcStatus(room, player.id, isNpc);
+    callback?.({ ok: true });
+    broadcast(room);
+    scheduleNpcTurn(room);
+  });
+
   socket.on("host:randomize-bracket", ({ code } = {}, callback) => {
     const room = rooms.get(typeof code === "string" ? code : "");
     if (!hostOnly(socket, room) || !randomizeBracket(room, () => randomInt(0, 1_000_000) / 1_000_000)) {
@@ -481,6 +737,10 @@ io.on("connection", (socket) => {
     }
     if (room.players.length < 2) {
       callback?.({ ok: false, error: "At least two participants must join before starting." });
+      return;
+    }
+    if (pendingGuestSockets(room).size) {
+      callback?.({ ok: false, error: "Every guest must create a player profile before the tournament can start." });
       return;
     }
     if (winnerId && !room.players.slice(0, 2).some((player) => player.id === winnerId)) {
@@ -681,6 +941,7 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     for (const room of rooms.values()) {
+      if (pendingGuestSockets(room).delete(socket.id)) broadcast(room);
       const player = room.players.find((entry) => entry.socketId === socket.id);
       if (player) {
         player.connected = false;

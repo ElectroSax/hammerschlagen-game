@@ -4,10 +4,125 @@ const MAX_HITS_TO_WIN = 10;
 const MIN_STAT = 0;
 const MAX_STAT = 5;
 const MAX_INTOXICATION = 6;
+const BACKUP_FORMAT = "hammerschlagen-tournament";
+const BACKUP_VERSION = 1;
 let nextMatchId = 1;
 
 function makeRoomCode() {
   return Math.random().toString(36).slice(2, 6).toUpperCase();
+}
+
+function createBackup(room) {
+  const savedRoom = structuredClone(room);
+  delete savedRoom.hostId;
+  for (const player of savedRoom.players) {
+    delete player.socketId;
+    delete player.reconnectTokenHash;
+    player.connected = false;
+  }
+  savedRoom.npcStepInProgress = false;
+  return { format: BACKUP_FORMAT, version: BACKUP_VERSION, room: savedRoom };
+}
+
+function restoreBackup(backup, hostId, code) {
+  const room = backup?.room;
+  if (backup?.format !== BACKUP_FORMAT || backup?.version !== BACKUP_VERSION ||
+      !room || typeof room !== "object" || !["lobby", "tournament", "complete"].includes(room.phase) ||
+      !Array.isArray(room.players) || room.players.length > MAX_PLAYERS ||
+      !Array.isArray(room.pendingMatches) || !Array.isArray(room.history) ||
+      !Array.isArray(room.seedIds) || !Array.isArray(room.roundWinners) ||
+      !Array.isArray(room.roundByes)) {
+    return { ok: false, error: "This file is not a valid Hammerschlagen tournament backup." };
+  }
+
+  const playerIds = new Set();
+  const playerNames = new Set();
+  for (const player of room.players) {
+    if (!player || typeof player.id !== "string" || !player.id ||
+        typeof player.name !== "string" || !player.name.trim() ||
+        typeof player.isNpc !== "boolean" ||
+        ["strength", "dexterity", "constitution", "wisdom"].some((stat) =>
+          !Number.isInteger(player[stat]) || player[stat] < MIN_STAT || player[stat] > MAX_STAT) ||
+        !Number.isInteger(player.drunk) || player.drunk < 0 || player.drunk > MAX_INTOXICATION ||
+        !Number.isInteger(player.beersDrank) || player.beersDrank < 0 ||
+        !Number.isInteger(player.wins) || player.wins < 0 ||
+        !Number.isInteger(player.losses) || player.losses < 0 ||
+        playerIds.has(player.id) || playerNames.has(player.name.trim().toLowerCase())) {
+      return { ok: false, error: "The backup contains an invalid or duplicate participant." };
+    }
+    playerIds.add(player.id);
+    playerNames.add(player.name.trim().toLowerCase());
+  }
+
+  const validIds = (ids) => Array.isArray(ids) && ids.every((id) => playerIds.has(id));
+  const validFirstRoundMatchups = (matchups) =>
+    Array.isArray(matchups) &&
+    matchups.length === Math.ceil(room.players.length / 2) &&
+    matchups.every((matchup) =>
+      Array.isArray(matchup) &&
+      matchup.length === 2 &&
+      matchup.every((id) => id === null || typeof id === "string" && playerIds.has(id)) &&
+      !(matchup[0] === null && matchup[1] === null)
+    ) &&
+    matchups.flat().filter((id) => id === null).length === room.players.length % 2 &&
+    matchups.flat().filter((id) => id !== null).length === playerIds.size &&
+    new Set(matchups.flat().filter((id) => id !== null)).size === playerIds.size;
+  const validMatch = (match, active = true) => match && Array.isArray(match.playerIds) &&
+    match.playerIds.length === 2 && validIds(match.playerIds) &&
+    match.playerIds[0] !== match.playerIds[1] &&
+    match.scores && match.gameWins && match.playerIds.every((id) =>
+      Number.isInteger(match.scores[id]) && match.scores[id] >= 0 &&
+      Number.isInteger(match.gameWins[id]) && match.gameWins[id] >= 0) &&
+    Number.isInteger(match.hitsToWin) && match.hitsToWin >= 1 && match.hitsToWin <= MAX_HITS_TO_WIN &&
+    [1, 3].includes(match.bestOf) && (!active ||
+      Number.isInteger(match.turnIndex) && match.turnIndex >= 0 && match.turnIndex < 2);
+  const validSettings = (settings) => settings &&
+    Number.isInteger(settings.hitsToWin) && settings.hitsToWin >= 1 &&
+    settings.hitsToWin <= MAX_HITS_TO_WIN && [1, 3].includes(settings.bestOf) &&
+    typeof settings.skipNpcOnly === "boolean";
+
+  if (!validIds(room.seedIds) || !validIds(room.roundWinners) || !validIds(room.roundByes) ||
+      !validIds(room.winnersEntrants) || !validIds(room.winnersByes) ||
+      !validIds(room.winnersStageWinners) || !validIds(room.winnersStageLosers) ||
+      !validIds(room.losersPool) || !validIds(room.losersStageWinners) ||
+      !validIds(room.losersStageByes) ||
+  room.firstRoundMatchups !== undefined && room.firstRoundMatchups !== null &&
+    !validFirstRoundMatchups(room.firstRoundMatchups) ||
+      !room.pendingMatches.every((match) => validMatch(match)) ||
+      !room.history.every((match) => validMatch(match, false)) ||
+      room.currentMatch !== null && !validMatch(room.currentMatch) ||
+      room.currentMatch && !validIds(room.currentMatch.bentIds) ||
+      room.currentMatch && !validIds(room.currentMatch.bonusIds) ||
+      room.currentMatch && !room.currentMatch.suddenDeathRound ||
+      room.currentMatch && !room.currentMatch.suddenDeathBeerDrank ||
+      !validSettings(room.defaultMatchSettings) || !validSettings(room.nextMatchSettings) ||
+      !["watch", "skip"].includes(room.npcMatchMode) ||
+      room.tournamentFormat !== undefined && !["single", "double"].includes(room.tournamentFormat)) {
+    return { ok: false, error: "The backup contains invalid tournament or matchup data." };
+  }
+
+  const restored = structuredClone(room);
+  restored.code = code;
+  restored.hostId = hostId;
+  restored.tournamentFormat ||= "double";
+  restored.npcStepInProgress = false;
+  for (const player of restored.players) {
+    delete player.socketId;
+    delete player.reconnectTokenHash;
+    player.connected = false;
+  }
+  if (restored.currentMatch) {
+    restored.currentMatch.originalStats ||= {};
+    restored.currentMatch.statPenalties ||= {};
+    for (const playerId of restored.currentMatch.playerIds) {
+      const player = restored.players.find((entry) => entry.id === playerId);
+      restored.currentMatch.originalStats[playerId] ||= Object.fromEntries(
+        ["strength", "dexterity", "wisdom"].map((stat) => [stat, player[stat]])
+      );
+      restored.currentMatch.statPenalties[playerId] ||= { strength: 0, dexterity: 0, wisdom: 0 };
+    }
+  }
+  return { ok: true, room: restored };
 }
 
 function createRoom(code, hostId) {
@@ -15,7 +130,9 @@ function createRoom(code, hostId) {
     code,
     hostId,
     phase: "lobby",
+    tournamentFormat: "double",
     players: [],
+    firstRoundMatchups: null,
     currentMatch: null,
     pendingMatches: [],
     roundWinners: [],
@@ -65,6 +182,30 @@ function createPlayer(id, name, isNpc = false) {
   };
 }
 
+function claimNpcCharacter(room, playerId, npcId) {
+  if (room.phase !== "lobby" || playerId === npcId) return false;
+  const player = room.players.find((entry) => entry.id === playerId);
+  const npc = room.players.find((entry) => entry.id === npcId);
+  if (!player?.connected || !player.socketId || player.isNpc || !npc?.isNpc) return false;
+  const socketId = player.socketId;
+
+  player.isNpc = true;
+  player.socketId = null;
+  player.connected = false;
+  npc.isNpc = false;
+  npc.socketId = socketId;
+  npc.connected = true;
+  return true;
+}
+
+function setParticipantNpcStatus(room, playerId, isNpc) {
+  if (typeof isNpc !== "boolean") return false;
+  const player = room.players.find((entry) => entry.id === playerId);
+  if (!player) return false;
+  player.isNpc = isNpc;
+  return true;
+}
+
 function createMatch(round, playerIds, roundIndex = 1, settings = {}) {
   return {
     matchId: nextMatchId++,
@@ -87,6 +228,8 @@ function createMatch(round, playerIds, roundIndex = 1, settings = {}) {
     pendingAdvance: null,
     lastSwing: null,
     lastDrink: null,
+    lastLuckyBullseye: null,
+    luckyBullseyeCount: 0,
     gamePointId: null,
     suddenDeathActive: false,
     suddenDeathRound: {},
@@ -119,6 +262,21 @@ function queueRound(room, playerIds, lane, roundIndex, label) {
 function queueWinnersRound(room) {
   room.winnersStageWinners = [];
   room.winnersStageLosers = [];
+  if (room.winnersRoundNumber === 1 && Array.isArray(room.firstRoundMatchups)) {
+    room.winnersByes = room.firstRoundMatchups
+      .filter((matchup) => matchup.includes(null))
+      .map((matchup) => matchup.find((playerId) => playerId !== null));
+    room.roundByes = [...room.winnersByes];
+    room.pendingMatches = [];
+    room.roundLabel = `Winners Round ${room.winnersRoundNumber}`;
+    for (const matchup of room.firstRoundMatchups) {
+      if (matchup.includes(null)) continue;
+      const match = createMatch(room.roundLabel, matchup, room.winnersRoundNumber);
+      match.lane = "winners";
+      room.pendingMatches.push(match);
+    }
+    return;
+  }
   room.winnersByes = room.winnersEntrants.length % 2
     ? [room.winnersEntrants[room.winnersEntrants.length - 1]]
     : [];
@@ -198,6 +356,20 @@ function seedTournament(room) {
 }
 
 function advanceBracketStage(room) {
+  if (room.tournamentFormat === "single") {
+    const advancing = [...room.winnersStageWinners, ...room.winnersByes];
+    if (advancing.length === 1) {
+      room.championId = advancing[0];
+      room.phase = "complete";
+      room.pendingMatches = [];
+      room.winnersEntrants = [];
+      return;
+    }
+    room.winnersEntrants = advancing;
+    room.winnersRoundNumber += 1;
+    queueWinnersRound(room);
+    return;
+  }
   if (room.tournamentStage === "winners") {
     const advancing = [...room.winnersStageWinners, ...room.winnersByes];
     room.losersPool.push(...room.winnersStageLosers);
@@ -317,7 +489,8 @@ function finishMatch(room, winnerId) {
     ])),
     winnerId,
     hitEffect: match.hitEffect ? { ...match.hitEffect } : null,
-    lastSwing: match.lastSwing ? { ...match.lastSwing } : null
+    lastSwing: match.lastSwing ? { ...match.lastSwing } : null,
+    lastLuckyBullseye: match.lastLuckyBullseye ? { ...match.lastLuckyBullseye } : null
   };
   room.history.push(completed);
   room.lastMatchStump = {
@@ -473,12 +646,25 @@ function recordBeer(player, match, random = Math.random, endsTurn = true) {
   return { outcome: "drink", drink: { ...match.lastDrink } };
 }
 
+function recordLuckyBullseye(match, playerId, swingCount, random) {
+  const roll = Math.floor(random() * 20) + 1;
+  match.lastLuckyBullseye = {
+    matchId: match.matchId,
+    count: ++match.luckyBullseyeCount,
+    swingCount,
+    playerId,
+    roll,
+    success: roll === 20
+  };
+  return match.lastLuckyBullseye;
+}
+
 function applyAction(room, playerId, action, random = Math.random, swingPosition = null) {
   return applyTurnAction(room, playerId, action, random, swingPosition, false);
 }
 
-function applyHostNpcAction(room, playerId, action, swingPosition = null) {
-  return applyTurnAction(room, playerId, action, Math.random, swingPosition, true);
+function applyHostNpcAction(room, playerId, action, swingPosition = null, random = Math.random) {
+  return applyTurnAction(room, playerId, action, random, swingPosition, true);
 }
 
 function applyTurnAction(room, playerId, action, random, swingPosition, allowNpc) {
@@ -551,6 +737,17 @@ function applyTurnAction(room, playerId, action, random, swingPosition, allowNpc
     : Number(swingPosition);
   const bent = match.bentIds.includes(playerId);
   const bonus = match.bonusIds.includes(playerId);
+  const stats = swingStats(player, bent, bonus, match.suddenDeathActive);
+  let luckyBullseye = null;
+  if (!match.suddenDeathActive && action === "hit" && Number.isFinite(position)) {
+    const distance = Math.abs(position - 50);
+    if (distance <= stats.criticalWidth / 2) {
+      action = "bullseye";
+    } else if (distance <= (stats.criticalWidth + stats.luckyWidth) / 2) {
+      luckyBullseye = recordLuckyBullseye(match, playerId, match.swingCount + 1, random);
+      if (luckyBullseye.success) action = "bullseye";
+    }
+  }
   match.lastSwing = {
     count: ++match.swingCount,
     playerId,
@@ -559,7 +756,8 @@ function applyTurnAction(room, playerId, action, random, swingPosition, allowNpc
     bent,
     bonus,
     drunk: player.drunk,
-    stats: swingStats(player, bent, bonus, match.suddenDeathActive)
+    stats,
+    luckyBullseye: luckyBullseye ? { ...luckyBullseye } : null
   };
 
   if (action === "hit" || action === "bullseye") {
@@ -642,6 +840,9 @@ function applyNpcTurn(room, random = Math.random) {
   const player = room.players.find((entry) => entry.id === playerId);
   if (!player?.isNpc) return { ok: false, error: "It is not an NPC turn." };
   if (match.pendingAdvance) return { ok: false, error: "Confirm the previous turn first." };
+  if (match.pendingDrinkPlayerId === playerId) {
+    return { ok: true, ...recordBeer(player, match, random) };
+  }
 
   const bent = match.bentIds.includes(playerId);
   const opponentId = match.playerIds.find((id) => id !== playerId);
@@ -684,17 +885,34 @@ function applyNpcTurn(room, random = Math.random) {
   if (roll < hitChance) {
     const hitFraction = roll / hitChance;
     const criticalChance = Math.min(1, swingSnapshot.stats.criticalWidth / swingSnapshot.stats.width);
-    const isCritical = criticalChance > 0 && hitFraction < criticalChance;
-    if (isCritical) {
+    const luckyChance = Math.min(1 - criticalChance, swingSnapshot.stats.luckyWidth / swingSnapshot.stats.width);
+    let action;
+    let luckyBullseye = null;
+    if (criticalChance > 0 && hitFraction < criticalChance) {
       position = 50 + ((hitFraction / criticalChance) * 2 - 1) * swingSnapshot.stats.criticalWidth / 2;
+      action = "bullseye";
+    } else if (luckyChance > 0 && hitFraction < criticalChance + luckyChance) {
+      position = npcLuckySwingPosition(
+        swingSnapshot.stats,
+        (hitFraction - criticalChance) / luckyChance
+      );
+      luckyBullseye = recordLuckyBullseye(match, playerId, match.swingCount + 1, random);
+      action = luckyBullseye.success ? "bullseye" : "hit";
     } else {
-      const regularHitFraction = criticalChance === 1
+      const regularHitFraction = criticalChance + luckyChance >= 1
         ? 0
-        : (hitFraction - criticalChance) / (1 - criticalChance);
+        : (hitFraction - criticalChance - luckyChance) / (1 - criticalChance - luckyChance);
       position = npcSwingPosition("hit", swingSnapshot.stats, regularHitFraction);
+      action = "hit";
     }
-    const action = isCritical ? "bullseye" : "hit";
-    match.lastSwing = { count: ++match.swingCount, playerId, action, position, ...swingSnapshot };
+    match.lastSwing = {
+      count: ++match.swingCount,
+      playerId,
+      action,
+      position,
+      ...swingSnapshot,
+      luckyBullseye: luckyBullseye ? { ...luckyBullseye } : null
+    };
     outcome = recordHit(room, match, player, action);
     if (outcome === "won") return { ok: true, outcome };
     if (outcome === "forfeit") return { ok: true, outcome };
@@ -714,7 +932,12 @@ function applyNpcTurn(room, random = Math.random) {
     outcome = "miss";
   }
 
-  if (room.currentMatch) match.pendingAdvance = { playerId, outcome };
+  if (room.currentMatch) {
+    match.pendingAdvance = {
+      playerId,
+      outcome: match.lastSwing?.action === "bullseye" && outcome === "hit" ? "bullseye" : outcome
+    };
+  }
   return { ok: true, outcome };
 }
 
@@ -729,13 +952,14 @@ function npcSwingPosition(outcome, stats, fraction) {
   const hitHalfWidth = stats.width / 2;
   const criticalHalfWidth = stats.criticalWidth / 2;
   if (outcome === "hit") {
-    const nonCriticalHalfWidth = Math.max(0, hitHalfWidth - criticalHalfWidth);
+    const luckyHalfWidth = stats.luckyWidth / 2;
+    const nonCriticalHalfWidth = Math.max(0, hitHalfWidth - criticalHalfWidth - luckyHalfWidth);
     const edgeMargin = Math.min(0.01, nonCriticalHalfWidth / 2);
     const usableHalfWidth = Math.max(0, nonCriticalHalfWidth - edgeMargin);
     const halfFraction = (boundedFraction % 0.5) * 2;
     return boundedFraction < 0.5
       ? 50 - hitHalfWidth + halfFraction * usableHalfWidth
-      : 50 + criticalHalfWidth + edgeMargin + halfFraction * usableHalfWidth;
+      : 50 + criticalHalfWidth + luckyHalfWidth + edgeMargin + halfFraction * usableHalfWidth;
   }
 
   const bendHalfWidth = stats.bendWidth;
@@ -755,6 +979,16 @@ function npcSwingPosition(outcome, stats, fraction) {
     : 100 - missSpan + (offset - missSpan);
 }
 
+function npcLuckySwingPosition(stats, fraction) {
+  const boundedFraction = Math.max(0, Math.min(0.999999, fraction));
+  const criticalHalfWidth = stats.criticalWidth / 2;
+  const luckyHalfWidth = stats.luckyWidth / 2;
+  const halfFraction = (boundedFraction % 0.5) * 2;
+  return boundedFraction < 0.5
+    ? 50 - criticalHalfWidth - luckyHalfWidth + halfFraction * luckyHalfWidth
+    : 50 + criticalHalfWidth + halfFraction * luckyHalfWidth;
+}
+
 function swingStats(player, isBent = false, hasBonus = false, isSuddenDeath = false) {
   const strength = isBent ? 0 : hasBonus ? MAX_STAT : player.strength;
   const baseWidth = Math.max(5, 16 + strength * 2.8 - player.drunk * 1.5);
@@ -765,7 +999,8 @@ function swingStats(player, isBent = false, hasBonus = false, isSuddenDeath = fa
   const bendShare = 0.3 + 0.45 * player.dexterity / MAX_STAT;
   return {
     width,
-    criticalWidth: isSuddenDeath ? 0 : isBent ? 2 : Math.min(7, 2 + player.strength * 0.25),
+    criticalWidth: isSuddenDeath ? 0 : width * 0.05,
+    luckyWidth: isSuddenDeath ? 0 : width * 0.1,
     bendWidth: missWidth * bendShare / 2,
     wisdomSlowdown: player.wisdom * 0.12,
     speed: Math.min(450, speedAtZeroDexterity * 0.7 / dexterityFactor)
@@ -817,11 +1052,12 @@ function setPlayerStats(player, stats) {
 }
 
 function npcHitChance(player) {
-  return 0.2 + ((player.strength + player.dexterity + player.wisdom) / 15) * 0.75;
+  return 0.33 + ((player.strength + player.dexterity + player.wisdom) / 15) * 0.62;
 }
 
 function randomizeBracket(room, random = Math.random) {
   if (room.phase !== "lobby" || room.players.length < 2) return false;
+  room.firstRoundMatchups = null;
   for (let index = room.players.length - 1; index > 0; index -= 1) {
     const target = Math.floor(random() * (index + 1));
     [room.players[index], room.players[target]] = [room.players[target], room.players[index]];
@@ -856,10 +1092,14 @@ function publicState(room) {
   return {
     code: room.code,
     phase: room.phase,
+    tournamentFormat: room.tournamentFormat || "double",
     players: room.players.map((player, seed) => {
       const { reconnectTokenHash, socketId, ...publicPlayer } = player;
       return { ...publicPlayer, seed: seed + 1 };
     }),
+    firstRoundMatchups: room.phase === "lobby" && room.firstRoundMatchups
+      ? room.firstRoundMatchups.map((matchup) => [...matchup])
+      : null,
     lastMatchStump: room.lastMatchStump ? {
       ...room.lastMatchStump,
       playerIds: [...room.lastMatchStump.playerIds],
@@ -883,6 +1123,9 @@ function publicState(room) {
             Object.entries(room.currentMatch.statPenalties).map(([id, stats]) => [id, { ...stats }])
           ),
           lastSwing: room.currentMatch.lastSwing ? { ...room.currentMatch.lastSwing } : null,
+          lastLuckyBullseye: room.currentMatch.lastLuckyBullseye
+            ? { ...room.currentMatch.lastLuckyBullseye }
+            : null,
           lastDrink: room.currentMatch.lastDrink ? { ...room.currentMatch.lastDrink } : null
         }
       : null,
@@ -900,7 +1143,8 @@ function publicState(room) {
       playerIds: [...match.playerIds],
       suddenDeathWinners: [...match.suddenDeathWinners],
       hitEffect: match.hitEffect ? { ...match.hitEffect } : null,
-      lastSwing: match.lastSwing ? { ...match.lastSwing } : null
+      lastSwing: match.lastSwing ? { ...match.lastSwing } : null,
+      lastLuckyBullseye: match.lastLuckyBullseye ? { ...match.lastLuckyBullseye } : null
     })),
     seedIds: [...room.seedIds],
     championId: room.championId,
@@ -923,10 +1167,12 @@ module.exports = {
   MAX_STAT,
   MAX_INTOXICATION,
   MIN_STAT,
+  claimNpcCharacter,
   applyAction,
   applyHostNpcAction,
   applyNpcTurn,
   awardMatchToWinner,
+  createBackup,
   confirmTurn,
   createPlayer,
   createRoom,
@@ -934,9 +1180,11 @@ module.exports = {
   publicState,
   randomizeBracket,
   restartCurrentMatch,
+  restoreBackup,
   resolveCurrentMatch,
   prepareNextMatch,
   setPlayerStats,
+  setParticipantNpcStatus,
   setMatchBestOf,
   setMatchHitsToWin,
   seedTournament,
