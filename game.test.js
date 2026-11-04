@@ -108,13 +108,13 @@ test("beer checks cap intoxication at six", () => {
   assert.equal(applyAction(room, "p1", "drink", () => 0).drink.threshold, 25);
 });
 
-test("sober-up uses a turn and reduces intoxication by one", () => {
+test("sober-up uses a turn and reduces intoxication by rounded half-Constitution", () => {
   const room = roomWithPlayers(2);
   startNextMatch(room);
   room.players[0].drunk = 3;
 
   assert.equal(applyAction(room, "p1", "sober-up").outcome, "sobered-up");
-  assert.equal(room.players[0].drunk, 2);
+  assert.equal(room.players[0].drunk, 1);
   assert.equal(room.currentMatch.turnIndex, 1);
   assert.equal(applyAction(room, "p1", "sober-up").ok, false);
 
@@ -122,7 +122,7 @@ test("sober-up uses a turn and reduces intoxication by one", () => {
   room.players[1].drunk = 2;
   const npcResult = applyNpcTurn(room, () => 0.05);
   assert.equal(npcResult.outcome, "sobered-up");
-  assert.equal(room.players[1].drunk, 1);
+  assert.equal(room.players[1].drunk, 0);
   assert.equal(room.currentMatch.pendingAdvance.outcome, "sobered-up");
   assert.equal(confirmTurn(room, null, true).ok, true);
   assert.equal(room.currentMatch.turnIndex, 0);
