@@ -230,6 +230,7 @@ function createMatch(round, playerIds, roundIndex = 1, settings = {}) {
     lastDrink: null,
     lastLuckyBullseye: null,
     luckyBullseyeCount: 0,
+    bullseyeOffset: Math.random() * 2 - 1,
     gamePointId: null,
     suddenDeathActive: false,
     suddenDeathRound: {},
@@ -463,6 +464,7 @@ function awardMatchToWinner(room, winnerId) {
 
 function advanceTurn(match) {
   match.turnIndex = (match.turnIndex + 1) % match.playerIds.length;
+  match.bullseyeOffset = Math.random() * 2 - 1;
 }
 
 function finishMatch(room, winnerId) {
@@ -577,6 +579,7 @@ function awardGame(room, match, winnerId) {
   match.suddenDeathRound = {};
   match.suddenDeathBeerDrank = {};
   match.turnIndex = (match.turnIndex + 1) % match.playerIds.length;
+  match.bullseyeOffset = Math.random() * 2 - 1;
   return "game-won";
 }
 
@@ -654,9 +657,57 @@ function recordLuckyBullseye(match, playerId, swingCount, random) {
     swingCount,
     playerId,
     roll,
-    success: roll === 20
+    success: roll === 20,
+    rerollsUsed: false,
+    scoreBefore: match.scores[playerId],
+    gamePointBefore: match.gamePointId
   };
   return match.lastLuckyBullseye;
+}
+
+function rerollLuckyBullseye(room, random = Math.random) {
+  const match = room.currentMatch;
+  const luckyBullseye = match?.lastLuckyBullseye;
+  if (!match?.pendingAdvance || !luckyBullseye ||
+      match.pendingAdvance.playerId !== luckyBullseye.playerId ||
+      match.lastSwing?.count !== luckyBullseye.swingCount ||
+      luckyBullseye.rerollsUsed) {
+    return { ok: false, error: "There is no eligible lucky bullseye roll to reroll." };
+  }
+
+  const roll = Math.floor(random() * 20) + 1;
+  const success = roll === 20;
+  const playerId = luckyBullseye.playerId;
+  luckyBullseye.roll = roll;
+  luckyBullseye.success = success;
+  luckyBullseye.rerollsUsed = true;
+  match.lastSwing.luckyBullseye = { ...luckyBullseye };
+  match.lastSwing.action = success ? "bullseye" : "hit";
+  match.scores[playerId] = Math.min(match.hitsToWin, luckyBullseye.scoreBefore + (success ? 2 : 1));
+  match.gamePointId = luckyBullseye.gamePointBefore;
+  match.suddenDeathActive = false;
+  match.suddenDeathRound = {};
+  match.suddenDeathBeerDrank = {};
+  const opponentId = match.playerIds.find((id) => id !== playerId);
+  let forfeitWinnerId = null;
+  if (match.scores[playerId] >= match.hitsToWin) {
+    if (match.scores[playerId] - match.scores[opponentId] > 2) {
+      forfeitWinnerId = playerId;
+    } else if (!match.gamePointId) {
+      match.gamePointId = playerId;
+    } else if (match.gamePointId !== playerId) {
+      match.gamePointId = null;
+      match.suddenDeathActive = true;
+    }
+  } else if (match.gamePointId === playerId) {
+    match.gamePointId = null;
+  }
+  match.pendingAdvance.outcome = success ? "bullseye" : "hit";
+  match.pendingAdvance.forfeitWinnerId = forfeitWinnerId;
+  if (match.hitEffect?.playerId === playerId && match.hitEffect.matchId === match.matchId) {
+    match.hitEffect.kind = success ? "bullseye" : "hit";
+  }
+  return { ok: true, roll, success };
 }
 
 function applyAction(room, playerId, action, random = Math.random, swingPosition = null) {
@@ -735,13 +786,15 @@ function applyTurnAction(room, playerId, action, random, swingPosition, allowNpc
   const position = swingPosition === null || swingPosition === undefined
     ? Number.NaN
     : Number(swingPosition);
+  if (action === "bullseye" && Number.isFinite(position)) action = "hit";
   const bent = match.bentIds.includes(playerId);
   const bonus = match.bonusIds.includes(playerId);
   const stats = swingStats(player, bent, bonus, match.suddenDeathActive);
+  const bullseyeCenter = 50 + (match.bullseyeOffset || 0) * stats.luckyWidth / 2;
   let luckyBullseye = null;
   if (!match.suddenDeathActive && action === "hit" && Number.isFinite(position)) {
     const distance = Math.abs(position - 50);
-    if (distance <= stats.criticalWidth / 2) {
+    if (Math.abs(position - bullseyeCenter) <= stats.criticalWidth / 2) {
       action = "bullseye";
     } else if (distance <= (stats.criticalWidth + stats.luckyWidth) / 2) {
       luckyBullseye = recordLuckyBullseye(match, playerId, match.swingCount + 1, random);
@@ -757,11 +810,12 @@ function applyTurnAction(room, playerId, action, random, swingPosition, allowNpc
     bonus,
     drunk: player.drunk,
     stats,
+    bullseyeCenter,
     luckyBullseye: luckyBullseye ? { ...luckyBullseye } : null
   };
 
   if (action === "hit" || action === "bullseye") {
-    const result = recordHit(room, match, player, action);
+    const result = recordHit(room, match, player, action, Boolean(luckyBullseye));
     if (result === "won") return { ok: true, outcome: "won" };
     if (result === "forfeit") return { ok: true, outcome: "forfeit" };
     if (result === "game-won") {
@@ -782,11 +836,17 @@ function applyTurnAction(room, playerId, action, random, swingPosition, allowNpc
     if (match.suddenDeathActive) match.suddenDeathRound[playerId] = false;
   }
 
-  match.pendingAdvance = { playerId, outcome: action };
+  match.pendingAdvance = {
+    playerId,
+    outcome: action,
+    ...(luckyBullseye && match.scores[playerId] - match.scores[match.playerIds.find((id) => id !== playerId)] > 2
+      ? { forfeitWinnerId: playerId }
+      : {})
+  };
   return { ok: true, outcome: action };
 }
 
-function recordHit(room, match, player, action) {
+function recordHit(room, match, player, action, deferForLuckyReroll = false) {
   const playerId = player.id;
   if (match.suddenDeathActive) {
     match.scores[playerId] += action === "bullseye" ? 2 : 1;
@@ -816,6 +876,7 @@ function recordHit(room, match, player, action) {
   if (match.scores[playerId] < match.hitsToWin) return "hit";
   const opponentId = match.playerIds.find((id) => id !== playerId);
   if (match.scores[playerId] - match.scores[opponentId] > 2) {
+    if (deferForLuckyReroll) return "hit";
     awardGame(room, match, playerId);
     return room.currentMatch ? "forfeit" : "won";
   }
@@ -880,21 +941,25 @@ function applyNpcTurn(room, random = Math.random) {
     drunk: player.drunk,
     stats: swingStats(player, bent, bonus, match.suddenDeathActive)
   };
+  swingSnapshot.bullseyeCenter =
+    50 + (match.bullseyeOffset || 0) * swingSnapshot.stats.luckyWidth / 2;
   let outcome;
   let position;
   if (roll < hitChance) {
     const hitFraction = roll / hitChance;
-    const criticalChance = Math.min(1, swingSnapshot.stats.criticalWidth / swingSnapshot.stats.width);
-    const luckyChance = Math.min(1 - criticalChance, swingSnapshot.stats.luckyWidth / swingSnapshot.stats.width);
+    const criticalChance = match.suddenDeathActive ? 0 : 0.01;
+    const luckyChance = match.suddenDeathActive ? 0 : 0.04;
     let action;
     let luckyBullseye = null;
     if (criticalChance > 0 && hitFraction < criticalChance) {
-      position = 50 + ((hitFraction / criticalChance) * 2 - 1) * swingSnapshot.stats.criticalWidth / 2;
+      position = swingSnapshot.bullseyeCenter +
+        ((hitFraction / criticalChance) * 2 - 1) * swingSnapshot.stats.criticalWidth / 2;
       action = "bullseye";
     } else if (luckyChance > 0 && hitFraction < criticalChance + luckyChance) {
       position = npcLuckySwingPosition(
         swingSnapshot.stats,
-        (hitFraction - criticalChance) / luckyChance
+        (hitFraction - criticalChance) / luckyChance,
+        swingSnapshot.bullseyeCenter
       );
       luckyBullseye = recordLuckyBullseye(match, playerId, match.swingCount + 1, random);
       action = luckyBullseye.success ? "bullseye" : "hit";
@@ -913,7 +978,7 @@ function applyNpcTurn(room, random = Math.random) {
       ...swingSnapshot,
       luckyBullseye: luckyBullseye ? { ...luckyBullseye } : null
     };
-    outcome = recordHit(room, match, player, action);
+    outcome = recordHit(room, match, player, action, Boolean(luckyBullseye));
     if (outcome === "won") return { ok: true, outcome };
     if (outcome === "forfeit") return { ok: true, outcome };
   } else if (roll < hitChance + bentChance) {
@@ -935,7 +1000,11 @@ function applyNpcTurn(room, random = Math.random) {
   if (room.currentMatch) {
     match.pendingAdvance = {
       playerId,
-      outcome: match.lastSwing?.action === "bullseye" && outcome === "hit" ? "bullseye" : outcome
+      outcome: match.lastSwing?.action === "bullseye" && outcome === "hit" ? "bullseye" : outcome,
+      ...(match.lastSwing?.luckyBullseye &&
+        match.scores[playerId] - match.scores[match.playerIds.find((id) => id !== playerId)] > 2
+        ? { forfeitWinnerId: playerId }
+        : {})
     };
   }
   return { ok: true, outcome };
@@ -979,14 +1048,14 @@ function npcSwingPosition(outcome, stats, fraction) {
     : 100 - missSpan + (offset - missSpan);
 }
 
-function npcLuckySwingPosition(stats, fraction) {
+function npcLuckySwingPosition(stats, fraction, bullseyeCenter) {
   const boundedFraction = Math.max(0, Math.min(0.999999, fraction));
-  const criticalHalfWidth = stats.criticalWidth / 2;
-  const luckyHalfWidth = stats.luckyWidth / 2;
-  const halfFraction = (boundedFraction % 0.5) * 2;
-  return boundedFraction < 0.5
-    ? 50 - criticalHalfWidth - luckyHalfWidth + halfFraction * luckyHalfWidth
-    : 50 + criticalHalfWidth + halfFraction * luckyHalfWidth;
+  const luckyStart = 50 - (stats.criticalWidth + stats.luckyWidth) / 2;
+  const bullseyeStart = bullseyeCenter - stats.criticalWidth / 2;
+  const luckyPosition = luckyStart + boundedFraction * stats.luckyWidth;
+  return luckyPosition < bullseyeStart
+    ? luckyPosition
+    : luckyPosition + stats.criticalWidth;
 }
 
 function swingStats(player, isBent = false, hasBonus = false, isSuddenDeath = false) {
@@ -999,8 +1068,8 @@ function swingStats(player, isBent = false, hasBonus = false, isSuddenDeath = fa
   const bendShare = 0.3 + 0.45 * player.dexterity / MAX_STAT;
   return {
     width,
-    criticalWidth: isSuddenDeath ? 0 : width * 0.05,
-    luckyWidth: isSuddenDeath ? 0 : width * 0.1,
+    criticalWidth: isSuddenDeath ? 0 : 1,
+    luckyWidth: isSuddenDeath ? 0 : (width * 0.12 + 1) * (hasBonus ? 2 : 1),
     bendWidth: missWidth * bendShare / 2,
     wisdomSlowdown: player.wisdom * 0.12,
     speed: Math.min(450, speedAtZeroDexterity * 0.7 / dexterityFactor)
@@ -1017,6 +1086,10 @@ function confirmTurn(room, playerId, isHost = false) {
   match.pendingAdvance = null;
   match.pendingDrinkPlayerId = null;
   match.lastDrink = null;
+  if (pending.forfeitWinnerId) {
+    awardGame(room, match, pending.forfeitWinnerId);
+    return { ok: true };
+  }
   advanceTurn(match);
   if (match.gamePointId && pending.playerId !== match.gamePointId) {
     const winnerId = match.gamePointId;
@@ -1082,6 +1155,46 @@ function restartCurrentMatch(room) {
       ["strength", "dexterity", "wisdom"].map((stat) => [stat, player[stat]])
     );
     room.currentMatch.statPenalties[id] = { strength: 0, dexterity: 0, wisdom: 0 };
+  });
+  return true;
+}
+
+function resetTournamentToLobby(room) {
+  if (room.phase === "lobby") return false;
+  restoreMatchStats(room, room.currentMatch);
+  room.phase = "lobby";
+  room.currentMatch = null;
+  room.pendingMatches = [];
+  room.roundWinners = [];
+  room.roundByes = [];
+  room.roundNumber = 1;
+  room.roundLabel = null;
+  room.tournamentStage = "winners";
+  room.winnersRoundNumber = 1;
+  room.losersRoundNumber = 0;
+  room.winnersEntrants = [];
+  room.winnersByes = [];
+  room.winnersStageWinners = [];
+  room.winnersStageLosers = [];
+  room.losersPool = [];
+  room.losersStageWinners = [];
+  room.losersStageByes = [];
+  room.winnersChampionId = null;
+  room.lowerChampionId = null;
+  room.grandFinalReset = false;
+  room.lastMatchStump = null;
+  room.history = [];
+  room.seedIds = [];
+  room.championId = null;
+  room.npcStepRequired = false;
+  room.npcStepInProgress = false;
+  room.npcManualTurnId = null;
+  room.nextMatchSettings = { ...room.defaultMatchSettings };
+  room.players.forEach((player) => {
+    player.wins = 0;
+    player.losses = 0;
+    player.beersDrank = 0;
+    player.drunk = 0;
   });
   return true;
 }
@@ -1172,6 +1285,7 @@ module.exports = {
   applyHostNpcAction,
   applyNpcTurn,
   awardMatchToWinner,
+  rerollLuckyBullseye,
   createBackup,
   confirmTurn,
   createPlayer,
@@ -1180,6 +1294,7 @@ module.exports = {
   publicState,
   randomizeBracket,
   restartCurrentMatch,
+  resetTournamentToLobby,
   restoreBackup,
   resolveCurrentMatch,
   prepareNextMatch,

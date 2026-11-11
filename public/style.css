@@ -49,6 +49,11 @@ h2 { margin: 0 0 10px; font: 1.55rem "Rye", Georgia, serif; }
 .backup-restore input { min-height: 36px; }
 .host-room-actions { align-items: center; display: flex; flex-wrap: wrap; gap: 10px; justify-content: end; }
 .host-room-actions .button { padding: 8px 11px; }
+.backup-export { align-items: start; display: grid; gap: 5px 9px; grid-template-columns: auto minmax(260px, 1fr); max-width: 560px; }
+.backup-export > .button { grid-column: 1; grid-row: 1; }
+.backup-export label { grid-column: 2; grid-row: 1 / span 2; }
+.backup-export textarea { background: #211914; border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: 10px/1.35 Consolas, monospace; min-height: 60px; padding: 7px; resize: vertical; width: 100%; }
+.backup-export .help { grid-column: 1 / -1; margin: 0; }
 .divider { align-items: center; color: var(--muted); display: flex; gap: 12px; margin: 26px 0 18px; font: 11px Consolas, monospace; text-transform: uppercase; }
 .divider::before, .divider::after { background: var(--line); content: ""; flex: 1; height: 1px; }
 .join-form { display: grid; gap: 12px; grid-template-columns: 1fr auto; text-align: left; }
@@ -142,7 +147,7 @@ footer { color: #927d68; font: 10px "DM Mono", monospace; margin-top: 24px; text
 .your-character-stats .toast { margin-bottom: 0; }
 .other-participants-panel h3 { align-items: center; display: flex; gap: 8px; margin: 0 0 10px; }
 .participant-count { align-items: center; background: var(--panel-light); border-radius: 50%; color: var(--muted); display: inline-flex; font: 11px Consolas, monospace; height: 23px; justify-content: center; width: 23px; }
-.lobby-participant-list { display: grid; gap: 7px; max-height: 175px; overflow-y: auto; }
+.lobby-participant-list { display: grid; gap: 7px; max-height: 400px; min-height: 70px; overflow-y: auto; }
 .lobby-participant { align-items: center; background: #211914; border: 1px solid #49372b; border-radius: 7px; display: flex; gap: 9px; min-width: 0; padding: 7px 9px; }
 .lobby-participant img { border: 1px solid #8a6743; border-radius: 50%; flex: 0 0 auto; height: 38px; object-fit: cover; width: 38px; }
 .lobby-participant div { display: grid; gap: 3px; min-width: 0; }
@@ -177,6 +182,7 @@ footer { color: #927d68; font: 10px "DM Mono", monospace; margin-top: 24px; text
 .participant-meta { color: var(--muted); font-size: 11px; margin: 8px 0 0; }
 .npc-form { align-items: end; border-top: 1px solid var(--line); display: grid; gap: 10px; grid-template-columns: 1fr auto; margin-top: 20px; padding-top: 16px; }
 .npc-form textarea { background: #211914; border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: 13px Consolas, monospace; padding: 9px 11px; resize: vertical; width: 100%; }
+.npc-form > .help { grid-column: 1 / -1; margin: 0; }
 .lobby-actions { display: flex; flex-wrap: wrap; gap: 9px; margin: 16px 0 10px; }
 .mode-select { margin: 14px 0; max-width: 300px; }
 .mode-select select { margin-top: 2px; }
@@ -262,6 +268,12 @@ footer { color: #927d68; font: 10px "DM Mono", monospace; margin-top: 24px; text
 .duelist > .player-name { min-height: 34px; }
 .duelist.match-winner { border-color: #e2a84d; box-shadow: 0 0 18px #e2a84d66; position: relative; }
 .duelist.active { border-color: var(--accent); box-shadow: 0 0 0 1px #e2a84d55; }
+.duelist.elimination-danger { animation: elimination-flash 700ms ease-in-out infinite alternate; }
+.duelist.drunk-card.elimination-danger { animation: card-wobble 480ms ease-in-out infinite alternate, elimination-flash 700ms ease-in-out infinite alternate; }
+@keyframes elimination-flash {
+  from { border-color: #8d3430; box-shadow: 0 0 0 1px #c34a4380; }
+  to { border-color: #ff6257; box-shadow: 0 0 18px #f0443caa; }
+}
 .duelist.drunk-card { animation: card-wobble 480ms ease-in-out infinite alternate; transform-origin: center; }
 @keyframes card-wobble { from { rotate: -1deg; } to { rotate: 1deg; } }
 .duelist .score { color: var(--accent); font: 2rem Consolas, monospace; margin-top: 8px; }
@@ -294,7 +306,7 @@ footer { color: #927d68; font: 10px "DM Mono", monospace; margin-top: 24px; text
 .target-zone { background: #94bd835c; border-left: 2px solid var(--green); border-right: 2px solid var(--green); bottom: 0; position: absolute; top: 0; z-index: 1; }
 .bend-risk { background: #cf493d99; border-left: 1px solid #ff7668; border-right: 1px solid #ff7668; bottom: 0; position: absolute; top: 0; z-index: 1; }
 .lucky-bullseye-zone { background: rgba(255, 220, 48, .2); border-left: 1px solid #ffe76e; border-right: 1px solid #ffe76e; bottom: 0; position: absolute; top: 0; z-index: 2; }
-.bullseye-zone { background: linear-gradient(90deg, #b47b20, #fff1a8 35% 65%, #b47b20); border-left: 1px solid #fff4bd; border-right: 1px solid #fff4bd; bottom: 0; left: 47.5%; position: absolute; top: 0; width: 5%; z-index: 2; }
+.bullseye-zone { background: linear-gradient(90deg, #b47b20, #fff1a8 35% 65%, #b47b20); border-left: 0px solid #fff4bd; border-right: 0px solid #fff4bd; bottom: 0; left: 49.5%; position: absolute; top: 0; width: 1%; z-index: 2; }
 .bullseye-announcement { align-items: center; background: linear-gradient(110deg, #4a3215, #8b651e, #4a3215); border: 1px solid #ffe18b; border-radius: 8px; box-shadow: 0 0 18px #f4c54b66; color: #fff1bd; display: flex; font: 800 1.15rem Consolas, monospace; gap: 12px; justify-content: center; letter-spacing: .08em; margin: 12px auto; max-width: 440px; padding: 11px 16px; text-align: center; }
 .bullseye-announcement strong { color: #fff7d9; }
 .bullseye-announcement span { background: #fff1bd; border-radius: 5px; color: #4a3215; padding: 4px 8px; }
@@ -330,9 +342,9 @@ footer { color: #927d68; font: 10px "DM Mono", monospace; margin-top: 24px; text
   100% { transform: perspective(120px) rotate3d(1, 1, .4, 360deg) scale(.92); }
 }
 .automatic-winner { align-items: end; flex-wrap: nowrap; }
-.automatic-winner .winner-choice, .automatic-winner #award-match { flex: 1 1 0; min-width: 0; width: auto; }
+.automatic-winner .winner-choice, .automatic-winner #award-match, .automatic-winner #coin-flip-match { flex: 1 1 0; min-width: 0; width: auto; }
 .automatic-winner .winner-choice { margin: 0; max-width: none; }
-.automatic-winner #award-match { font-size: 12px; min-height: 42px; padding: 8px 10px; }
+.automatic-winner #award-match, .automatic-winner #coin-flip-match { font-size: 12px; min-height: 42px; padding: 8px 10px; }
 .confetti-layer { inset: 0; overflow: hidden; pointer-events: none; position: fixed; z-index: 1000; }
 .confetti-layer span { animation: confetti-fall var(--duration) linear var(--delay) infinite; background: var(--color); height: 12px; left: var(--left); position: absolute; top: -16px; width: 8px; }
 @keyframes confetti-fall {
@@ -370,6 +382,8 @@ footer { color: #927d68; font: 10px "DM Mono", monospace; margin-top: 24px; text
 .toast { color: var(--accent); min-height: 20px; margin: 10px 0 0; }
 .champion { color: var(--accent); font: bold 1.4rem Georgia, serif; margin: 14px 0 0; }
 @media (max-width: 680px) {
+  .backup-export { grid-template-columns: minmax(0, 1fr); width: 100%; }
+  .backup-export > .button, .backup-export label, .backup-export .help { grid-column: 1; grid-row: auto; }
   .shell { padding-top: 34px; }
   .join-form { grid-template-columns: 1fr; }
   .join-form .button { width: 100%; }
@@ -394,7 +408,7 @@ footer { color: #927d68; font: 10px "DM Mono", monospace; margin-top: 24px; text
   .match-settings { align-items: stretch; display: grid; grid-template-columns: 1fr 1fr; }
   .duelist { padding: 12px; }
   .automatic-winner { flex-wrap: wrap; }
-  .automatic-winner .winner-choice, .automatic-winner #award-match { flex-basis: calc(50% - 5px); }
+  .automatic-winner .winner-choice, .automatic-winner #award-match, .automatic-winner #coin-flip-match { flex-basis: calc(50% - 5px); }
   .checkbox-label { grid-column: 1 / -1; }
 }
 @media (max-width: 420px) {

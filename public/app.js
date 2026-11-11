@@ -8,6 +8,7 @@
   let roomCode = null;
   let playerId = null;
   let roomState = null;
+  let backupTextRequestId = 0;
   let draggedLobbyParticipantId = null;
   let draggedLobbyPointerY = null;
   let selectedLobbyParticipantId = null;
@@ -150,7 +151,7 @@
 
   function observeLuckyRoll(luckyBullseye) {
     if (!luckyBullseye) return null;
-    const key = `${luckyBullseye.matchId}:${luckyBullseye.count}`;
+    const key = `${luckyBullseye.matchId}:${luckyBullseye.count}:${luckyBullseye.roll}:${luckyBullseye.rerollsUsed}`;
     if (key !== lastLuckyRollKey) {
       lastLuckyRollKey = key;
       playSound("dice");
@@ -180,8 +181,8 @@
     const speedAtZeroDexterity = 105 / (0.7 + 3 * 0.15) * 2.5;
     return {
       width,
-      criticalWidth: isSuddenDeath ? 0 : width * 0.05,
-      luckyWidth: isSuddenDeath ? 0 : width * 0.1,
+      criticalWidth: isSuddenDeath ? 0 : 1,
+      luckyWidth: isSuddenDeath ? 0 : (width * 0.12 + 1) * (hasBonus ? 2 : 1),
       bendWidth: (100 - width) * (0.25 + 0.5 * player.dexterity / 5) / 2,
       wisdomSlowdown: player.wisdom * 0.12,
       speed: Math.min(450, speedAtZeroDexterity * 0.75 / dexterityFactor)
@@ -425,7 +426,12 @@
       showToast(response?.error || "Could not create a tournament backup.");
       return;
     }
+    backupTextRequestId += 1;
     const contents = JSON.stringify(response.backup, null, 2);
+    const backupText = document.querySelector("#backup-json");
+    const backupStatus = document.querySelector("#backup-json-status");
+    if (backupText) backupText.value = contents;
+    if (backupStatus) backupStatus.textContent = "Emergency backup JSON is ready to copy.";
     const blob = new Blob([contents], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
@@ -434,6 +440,23 @@
     link.click();
     URL.revokeObjectURL(url);
     showToast("Tournament backup downloaded.");
+  }
+
+  async function refreshTournamentBackupText() {
+    const backupText = document.querySelector("#backup-json");
+    const backupStatus = document.querySelector("#backup-json-status");
+    if (!backupText || !backupStatus) return;
+    const requestId = ++backupTextRequestId;
+    backupStatus.textContent = "Updating emergency backup JSON…";
+    const response = await emitWithCallback("host:backup", { code: roomCode });
+    if (requestId !== backupTextRequestId || !backupText.isConnected) return;
+    if (!response?.ok) {
+      backupText.value = "";
+      backupStatus.textContent = response?.error || "Could not update the emergency backup JSON.";
+      return;
+    }
+    backupText.value = JSON.stringify(response.backup, null, 2);
+    backupStatus.textContent = "Copy this JSON into a .json file to keep an emergency backup.";
   }
 
   function matchupStatsMarkup(player, match) {
@@ -462,10 +485,8 @@
 
   function luckyZonesMarkup(stats) {
     if (!stats?.luckyWidth) return "";
-    const luckyHalfWidth = stats.luckyWidth / 2;
-    const bullseyeHalfWidth = stats.criticalWidth / 2;
-    return `<div class="lucky-bullseye-zone" aria-label="Lucky bullseye zone" style="left:${50 - bullseyeHalfWidth - luckyHalfWidth}%;width:${luckyHalfWidth}%"></div>
-      <div class="lucky-bullseye-zone" aria-label="Lucky bullseye zone" style="left:${50 + bullseyeHalfWidth}%;width:${luckyHalfWidth}%"></div>`;
+    const zoneWidth = stats.criticalWidth + stats.luckyWidth;
+    return `<div class="lucky-bullseye-zone" aria-label="Lucky bullseye zone" style="left:${50 - zoneWidth / 2}%;width:${zoneWidth}%"></div>`;
   }
 
   function characterImagePicker(player) {
@@ -605,7 +626,13 @@
           <div><p class="eyebrow">Host controls</p><h2>Your game room</h2></div>
           <div class="host-room-actions">
             <div class="room-code">${roomState.code}</div>
-            <button id="download-backup" class="button button-secondary" type="button">Download tournament backup</button>
+            <div class="backup-export">
+              <button id="download-backup" class="button button-secondary" type="button">Download tournament backup</button>
+              <label for="backup-json">Emergency backup JSON
+                <textarea id="backup-json" rows="3" readonly aria-describedby="backup-json-status"></textarea>
+              </label>
+              <p id="backup-json-status" class="help" role="status">Preparing backup JSON…</p>
+            </div>
           </div>
         </div>
         <section class="card">
@@ -616,9 +643,10 @@
           ${roomState.players.length && roomState.phase !== "lobby" ? `<div class="roster">${hostRoster()}</div>` : !roomState.players.length ? `<p class="muted">Waiting for players…</p>` : ""}
           ${roomState.phase === "lobby" ? `
             <form id="add-npc-form" class="npc-form">
-              <label>NPCs (Name,Strength,Dexterity,Constitution,Wisdom)
-                <textarea name="entries" rows="4" placeholder="Rivet,5,5,3,4&#10;Sparky,2,4,1,3" required></textarea>
+              <label>NPCs (Name,Strength,Dexterity,Constitution,Wisdom,[Image Name])
+                <textarea name="entries" rows="4" placeholder="Rivet,5,5,3,4,Brock Token.png&#10;Sparky,2,4,1,3" required></textarea>
               </label>
+              <p class="help">Image is optional. Unknown image filenames use Generic NPC.png.</p>
               <button class="button button-secondary" type="submit" ${roomState.players.length + (roomState.pendingPlayerCount || 0) >= 32 ? "disabled" : ""}>Add NPCs</button>
             </form>
             <div class="lobby-actions">
@@ -761,18 +789,29 @@
     const luckyBullseye = resultMatch?.lastLuckyBullseye;
     const latestResultSwing = resultMatch?.lastSwing;
     const isLatestLuckySwing = Boolean(
-      luckyBullseye && latestResultSwing?.count === luckyBullseye.swingCount
+      luckyBullseye &&
+      latestResultSwing?.count === luckyBullseye.swingCount &&
+      (!match || match.pendingAdvance?.playerId === luckyBullseye.playerId)
     );
     const luckyRoll = isLatestLuckySwing ? observeLuckyRoll(luckyBullseye) : null;
     const luckyRollMarkup = isLatestLuckySwing
       ? `<div class="lucky-roll ${luckyRoll?.rolling ? "rolling" : ""}" role="status" aria-live="polite">
           <span class="beer-die lucky-die ${luckyRoll?.rolling ? "rolling" : ""}" aria-label="Twenty-sided die ${luckyRoll?.rolling ? "rolling" : `showing ${luckyRoll?.value}`}">${renderD20(luckyRoll?.value ?? luckyBullseye.roll)}</span>
           <strong>${luckyRoll?.rolling ? `Rolling for ${escapeHtml(playerName(luckyBullseye.playerId))}…` : luckyBullseye.success ? `${escapeHtml(playerName(luckyBullseye.playerId))} got a Lucky Bullseye!` : `${escapeHtml(playerName(luckyBullseye.playerId))} rolled ${luckyBullseye.roll} — regular hit.`}</strong>
+          ${isHost && match?.pendingAdvance && !luckyBullseye.rerollsUsed && !luckyRoll?.rolling
+            ? '<button id="reroll-lucky-bullseye" class="button button-secondary">Host reroll (once)</button>'
+            : ""}
         </div>`
       : "";
     const pendingLuckyBullseye = Boolean(
       pendingBullseye && match?.lastSwing?.luckyBullseye?.success
     );
+    const eliminationRiskId = match?.suddenDeathActive
+      ? match.playerIds.find((id) =>
+        match.suddenDeathRound?.[id] === false &&
+        match.suddenDeathRound?.[match.playerIds.find((opponentId) => opponentId !== id)] !== true
+      )
+      : null;
     const turnBannerMessage = isWaitingForConfirm && match?.lastSwing?.luckyBullseye
       ? luckyRoll?.rolling
         ? `${escapeHtml(playerName(pendingAdvance.playerId))} hit the lucky zone — rolling d20…`
@@ -824,6 +863,8 @@
       ? calculateSwingStats(statsPlayer, heldSwing.bent, heldSwing.bonus, Boolean(match?.suddenDeathActive))
       : heldSwing?.stats || liveSwingStats;
     const { width, criticalWidth, bendWidth, speed } = shownSwingStats;
+    const bullseyeCenter = heldSwing?.bullseyeCenter ??
+      50 + (match?.bullseyeOffset || 0) * shownSwingStats.luckyWidth / 2;
     const targetStart = 50 - width / 2;
     const dangerWidth = Math.min(bendWidth, targetStart);
     const rightDangerStart = targetStart + width;
@@ -845,7 +886,7 @@
             <div class="target-zone" style="left:${finalTargetStart}%;width:${finalStats.width}%"></div>
             <div class="bend-risk" style="left:${finalRightBendStart}%;width:${finalRightBendWidth}%"></div>
             ${luckyZonesMarkup(finalStats)}
-            ${finalStats.criticalWidth ? `<div class="bullseye-zone" style="left:${50 - finalStats.criticalWidth / 2}%;width:${finalStats.criticalWidth}%"></div>` : ""}` : ""}
+            ${finalStats.criticalWidth ? `<div class="bullseye-zone" style="left:${(finalSwing.bullseyeCenter ?? 50) - finalStats.criticalWidth / 2}%;width:${finalStats.criticalWidth}%"></div>` : ""}` : ""}
           <div class="needle held" style="left:${finalSwing.position}%"></div></div></div>`
       : "";
     const completedMatch = roomState.lastMatchStump;
@@ -872,6 +913,15 @@
       ...(match ? [{ ...match, status: "active" }] : []),
       ...roomState.pendingMatches.map((entry) => ({ ...entry, status: "upcoming" }))
     ];
+    if (roomState.roundLabel && roomState.roundByes?.length) {
+      const lane = roomState.roundLabel.startsWith("Losers") ? "losers" : "winners";
+      bracketMatches.push(...roomState.roundByes.map((id) => ({
+        round: roomState.roundLabel,
+        playerIds: [id, null],
+        status: "bye",
+        lane
+      })));
+    }
     const bracketLanes = roomState.tournamentFormat === "single"
       ? [["winners", "Single-elimination bracket"]]
       : [
@@ -932,11 +982,12 @@
           <h4>${escapeHtml(round)}</h4>
           <div class="bracket-matches">
             ${entries.map((entry) => `<div class="bracket-match ${entry.status} ${entry.playerIds.every((id) => !id) ? "placeholder" : ""}">
-              <span class="bracket-status">${entry.status === "complete" ? "Complete" : entry.status === "active" ? "In progress" : entry.playerIds.every((id) => !id) ? roomState.phase === "complete" ? "Not played" : "Upcoming match" : "Up next"}</span>
+              <span class="bracket-status">${entry.status === "complete" ? "Complete" : entry.status === "active" ? "In progress" : entry.status === "bye" ? "Bye" : entry.playerIds.every((id) => !id) ? roomState.phase === "complete" ? "Not played" : "Upcoming match" : "Up next"}</span>
               ${entry.playerIds.map((id) => {
                 const score = entry.gameWins?.[id] ?? (entry.status === "complete" ? entry.scores?.[id] : "");
                 const suddenDeathWin = id && entry.suddenDeathWinners?.includes(id);
-                return `<div class="bracket-player ${id && id === entry.winnerId ? "winner" : ""}">${id ? escapeHtml(playerName(id)) : "&nbsp;"}<span>${id ? `${score ?? ""}${suddenDeathWin ? ' <span class="sudden-death-star" title="Game won in sudden death" aria-label="Won a game in sudden death">★</span>' : ""}` : ""}</span></div>`;
+                const name = id ? escapeHtml(playerName(id)) : entry.status === "bye" ? "BYE" : "&nbsp;";
+                return `<div class="bracket-player ${id && id === entry.winnerId ? "winner" : ""}">${name}<span>${id ? `${score ?? ""}${suddenDeathWin ? ' <span class="sudden-death-star" title="Game won in sudden death" aria-label="Won a game in sudden death">★</span>' : ""}` : ""}</span></div>`;
               }).join("")}
             </div>`).join("")}
           </div>
@@ -976,6 +1027,7 @@
                      </select>
                    </label>
                    <button id="award-match" class="button button-secondary">Award match · ${match.hitsToWin}/${match.hitsToWin} hits</button>
+                   <button id="coin-flip-match" class="button button-secondary">Flip coin &amp; award</button>
                  </div>` : ""}
                  <div class="matchup">
                    ${match.playerIds.map((id, index) => {
@@ -985,7 +1037,7 @@
                      );
                      const fighterDrunk = displayedDrunk(fighter, lastDrink, currentBeerRoll);
                      return `<div class="duelist-column">
-                       <div class="duelist ${index === match.turnIndex ? "active" : ""} ${fighterDrunk ? "drunk-card" : ""}">
+                       <div class="duelist ${index === match.turnIndex ? "active" : ""} ${fighterDrunk ? "drunk-card" : ""} ${id === eliminationRiskId ? "elimination-danger" : ""}">
                        <img class="duelist-portrait" src="${characterImageUrl(fighter.characterImage || "Generic NPC.png")}" alt="${escapeHtml(fighter.name)}">
                        <div class="player-name">${escapeHtml(fighter.name)}</div>
                        ${isHost && fighter.isNpc ? `<div class="npc-hit-chance">Hit chance ${fighterNpcHitChance}%</div>` : ""}
@@ -1014,7 +1066,7 @@
                      <div class="target-zone" style="left:${targetStart}%;width:${width}%"></div>
                      <div class="bend-risk" style="left:${rightDangerStart}%;width:${rightDangerWidth}%"></div>
                      ${luckyZonesMarkup(shownSwingStats)}
-                     ${criticalWidth ? `<div class="bullseye-zone" title="Bullseye: worth two hits" style="left:${50 - criticalWidth / 2}%;width:${criticalWidth}%"></div>` : ""}
+                     ${criticalWidth ? `<div class="bullseye-zone" title="Bullseye: worth two hits" style="left:${bullseyeCenter - criticalWidth / 2}%;width:${criticalWidth}%"></div>` : ""}
                      <div id="needle" class="needle ${isWaitingForConfirm || isPendingDrink ? "held" : ""}" style="${match?.lastSwing ? `left:${match.lastSwing.position}%` : ""}"></div>
                    </div>
                    </div>
@@ -1065,6 +1117,7 @@
       bonus: false,
       beers: 0,
       drunk: 0,
+      bullseyeOffset: Math.random() * 2 - 1,
       pendingDrink: false,
       rollingBeer: false,
       beerRoll: null,
@@ -1122,11 +1175,16 @@
     };
   }
 
+  function randomPracticeOffset() {
+    return Math.random() * 2 - 1;
+  }
+
   function practiceMarkup() {
     practiceState.constitution = findPlayer(playerId)?.constitution ?? practiceState.constitution;
     practiceState.stats.drunk = practiceState.drunk;
     practiceState.stats.constitution = practiceState.constitution;
     const stats = calculateSwingStats(practiceState.stats, practiceState.bent, practiceState.bonus);
+    const bullseyeCenter = 50 + practiceState.bullseyeOffset * stats.luckyWidth / 2;
     const targetStart = 50 - stats.width / 2;
     const dangerWidth = Math.min(stats.bendWidth, targetStart);
     const rightDangerStart = targetStart + stats.width;
@@ -1134,7 +1192,7 @@
     return `<section class="practice-game" aria-label="Solo swing practice">
       <h3>Solo swing practice</h3>
       <p class="help">Practice unlimited swings with random Strength, Dexterity, and Wisdom. Strength increases the Hit Zone, Dexterity lowers the speed of the hammer bar, Constitution improves your chances to resist becoming drunk, and Wisdom slows the hammer bar in the hit zone.</p>
-      <p class="help">Landing a hit in the very center grants a critical hit, giving you 2 hits. When the nail is bent, it increases the difficulty of hitting it next round. You may spend a turn to straighten the nail, which makes your next hit far easier. Missing the nail entirely causes you to drink a beer, forcing you to roll a constitution save to prevent becoming intoxicated. Becoming intoxicated makes hits more difficult for the rest of the match. You can use your turn to sober up, reducing your intoxciation level by your CON/2.</p>
+      <p class="help">Landing in the moving gold bullseye grants a critical hit, giving you 2 hits. When the nail is bent, it increases the difficulty of hitting it next round. You may spend a turn to straighten the nail, which makes your next hit far easier and doubles the lucky zone. Missing the nail entirely causes you to drink a beer, forcing you to roll a constitution save to prevent becoming intoxicated. Becoming intoxicated makes hits more difficult for the rest of the match. You can use your turn to sober up, reducing your intoxciation level by your CON/2.</p>
       <p class="practice-stats">Practice stats · STR ${practiceState.stats.strength} · DEX ${practiceState.stats.dexterity} · CON ${practiceState.constitution} · WIS ${practiceState.stats.wisdom}${practiceState.bent ? " · Nail bent" : ""}${practiceState.bonus ? " · Straightening bonus" : ""} · Beers ${practiceState.beers}${practiceState.drunk ? ` · Intoxicated x${practiceState.drunk}` : ""}</p>
       <div class="meter-scroll">
         <div class="target-label"><span>Miss</span><span>Bend</span><span>Hit zone</span><span>Bend</span><span>Miss</span></div>
@@ -1145,7 +1203,7 @@
           <div class="target-zone" style="left:${targetStart}%;width:${stats.width}%"></div>
           <div class="bend-risk" style="left:${rightDangerStart}%;width:${rightDangerWidth}%"></div>
           ${luckyZonesMarkup(stats)}
-          ${stats.criticalWidth ? `<div class="bullseye-zone" style="left:${50 - stats.criticalWidth / 2}%;width:${stats.criticalWidth}%"></div>` : ""}
+          ${stats.criticalWidth ? `<div class="bullseye-zone" style="left:${bullseyeCenter - stats.criticalWidth / 2}%;width:${stats.criticalWidth}%"></div>` : ""}
           <div id="practice-needle" class="needle" style="left:${practiceState.position}%"></div>
           </div>
         </div>
@@ -1223,7 +1281,9 @@
       if (practiceFrame) cancelAnimationFrame(practiceFrame);
       const stats = calculateSwingStats(practiceState.stats, practiceState.bent, practiceState.bonus);
       const distance = Math.abs(practiceState.position - 50);
-      const result = stats.criticalWidth > 0 && distance <= stats.criticalWidth / 2 ? "bullseye"
+      const bullseyeDistance = Math.abs(practiceState.position -
+        (50 + practiceState.bullseyeOffset * stats.luckyWidth / 2));
+      const result = stats.criticalWidth > 0 && bullseyeDistance <= stats.criticalWidth / 2 ? "bullseye"
         : stats.luckyWidth > 0 && distance <= (stats.criticalWidth + stats.luckyWidth) / 2 ? "lucky"
         : distance <= stats.width / 2 ? "hit"
           : distance <= stats.width / 2 + stats.bendWidth ? "bent"
@@ -1253,6 +1313,7 @@
         practiceState.pendingDrink = true;
         practiceState.beerRoll = null;
       }
+      practiceState.bullseyeOffset = randomPracticeOffset();
       practiceState.stats = randomPracticeStats();
       practiceState.position = 0;
       practiceState.direction = 1;
@@ -1281,6 +1342,7 @@
         practiceState.stats.drunk = practiceState.drunk;
         practiceState.rollingBeer = false;
         practiceState.pendingDrink = false;
+        practiceState.bullseyeOffset = randomPracticeOffset();
         practiceState.message = `Sobriety Check DC ${threshold}: rolled a ${roll + practiceState.constitution} (${roll}+${practiceState.constitution})`;
         repaintPractice();
       }, 1500);
@@ -1288,7 +1350,8 @@
     document.querySelector("#practice-straighten")?.addEventListener("click", () => {
       practiceState.bent = false;
       practiceState.bonus = true;
-      practiceState.message = "Nail straightened. The next hit zone matches Strength 5.";
+      practiceState.bullseyeOffset = randomPracticeOffset();
+      practiceState.message = "Nail straightened. The next hit zone matches Strength 5 and the lucky zone doubles.";
       practiceState.position = 0;
       practiceState.direction = 1;
       repaintPractice();
@@ -1342,6 +1405,7 @@
         practiceState.message = `Lucky roll ${roll} — regular practice hit.`;
       }
       practiceState.bonus = false;
+      practiceState.bullseyeOffset = randomPracticeOffset();
       practiceState.luckyRoll = roll;
       practiceState.stats = randomPracticeStats();
       playSound("hit");
@@ -1440,6 +1504,8 @@
 
   function bindHostControls() {
     document.querySelector("#download-backup")?.addEventListener("click", downloadTournamentBackup);
+    document.querySelector("#backup-json")?.addEventListener("focus", (event) => event.currentTarget.select());
+    refreshTournamentBackupText();
     if (roomState.currentMatch) startMeter();
     document.querySelector("#current-best-of")?.addEventListener("change", async (event) => {
       const response = await emitWithCallback("host:set-match-best-of", {
@@ -1511,6 +1577,10 @@
       const response = await emitWithCallback("host:confirm-turn", { code: roomCode });
       if (!response?.ok) showToast(response?.error || "Could not confirm the turn.");
     });
+    document.querySelector("#reroll-lucky-bullseye")?.addEventListener("click", async () => {
+      const response = await emitWithCallback("host:lucky-reroll", { code: roomCode });
+      if (!response?.ok) showToast(response?.error || "Could not reroll the lucky bullseye.");
+    });
     document.querySelector("#award-match")?.addEventListener("click", async () => {
       const response = await emitWithCallback("host:award-match", {
         code: roomCode,
@@ -1518,15 +1588,24 @@
       });
       if (!response?.ok) showToast(response?.error || "Could not award the match.");
     });
+    document.querySelector("#coin-flip-match")?.addEventListener("click", async () => {
+      const response = await emitWithCallback("host:coin-flip-match", { code: roomCode });
+      if (!response?.ok) {
+        showToast(response?.error || "Could not flip the coin and award the match.");
+        return;
+      }
+      showToast(`${response.coin}: ${findPlayer(response.winnerId)?.name || "Participant"} wins the match.`);
+    });
     document.querySelector("#restart-match")?.addEventListener("click", async () => {
       if (!confirm("Restart this match? Scores, beers, and drunkenness for both fighters will reset.")) return;
       const response = await emitWithCallback("host:restart-match", { code: roomCode });
       if (!response?.ok) showToast(response?.error || "Could not restart this match.");
     });
     document.querySelector("#restart-tournament")?.addEventListener("click", async () => {
-      if (!confirm("Restart the tournament from the first round? Match results, wins, beers, and drunkenness will reset.")) return;
+      if (!confirm("Return everyone to the pre-tournament lobby? Match results, wins, beers, and drunkenness will reset. You can adjust the bracket and settings before starting again.")) return;
       const response = await emitWithCallback("host:restart-tournament", { code: roomCode });
-      if (!response?.ok) showToast(response?.error || "Could not restart the tournament.");
+      if (!response?.ok) showToast(response?.error || "Could not return to the pre-tournament lobby.");
+      else selectedLobbyParticipantId = null;
     });
     document.querySelector("#add-npc-form")?.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -1535,14 +1614,26 @@
       const entries = [];
       for (const line of lines) {
         const parts = line.split(",").map((part) => part.trim());
-        if (![4, 5].includes(parts.length) || !parts[0] || parts.slice(1).some((part) => !/^[0-5]$/.test(part))) {
+        const hasWisdom = parts.length >= 5 && /^[0-5]$/.test(parts[4]);
+        const imagePart = parts.length === 6
+          ? parts[5]
+          : parts.length === 5 && !hasWisdom ? parts[4] : "";
+        if (parts.length < 4 || parts.length > 6 || !parts[0] ||
+            parts.slice(1, 4).some((part) => !/^[0-5]$/.test(part)) ||
+            parts.length === 6 && !hasWisdom) {
           const error = document.querySelector("#host-error");
-          if (error) error.textContent = `Invalid NPC line: "${line}". Use Name,Strength,Dexterity,Constitution[,Wisdom] (stats 0–5).`;
+          if (error) error.textContent = `Invalid NPC line: "${line}". Use Name,Strength,Dexterity,Constitution[,Wisdom][,Image] (stats 0–5).`;
           return;
         }
         entries.push({
           name: parts[0],
-          stats: { strength: Number(parts[1]), dexterity: Number(parts[2]), constitution: Number(parts[3]), wisdom: parts[4] === undefined ? 3 : Number(parts[4]) }
+          stats: {
+            strength: Number(parts[1]),
+            dexterity: Number(parts[2]),
+            constitution: Number(parts[3]),
+            wisdom: hasWisdom ? Number(parts[4]) : 3
+          },
+          characterImage: imagePart
         });
       }
       const response = await emitWithCallback("host:add-npcs", { code: roomCode, entries });
@@ -1734,7 +1825,7 @@
     document.querySelector("#straighten")?.addEventListener("click", async () => {
       const response = await emitWithCallback("game:action", { code: roomCode, action: "straighten" });
       if (!response?.ok) showToast(response?.error || "Could not straighten the nail.");
-      else showToast("Nail straightened. Your turn is spent.");
+      else showToast("Nail straightened. Your next hit gets the Strength 5 target and a doubled lucky zone.");
     });
     document.querySelector("#sober-up")?.addEventListener("click", async () => {
       const response = await emitWithCallback("game:action", { code: roomCode, action: "sober-up" });
@@ -1914,9 +2005,12 @@
     }
     const isBent = match.bentIds.includes(actingId);
     const hasBonus = match.bonusIds.includes(actingId);
-    const { width, criticalWidth, bendWidth } = calculateSwingStats(player, isBent, hasBonus, match.suddenDeathActive);
+    const stats = calculateSwingStats(player, isBent, hasBonus, match.suddenDeathActive);
+    const { width, criticalWidth, bendWidth } = stats;
+    const bullseyeCenter = 50 + (match.bullseyeOffset || 0) * stats.luckyWidth / 2;
     const distance = Math.abs(markerPosition - 50);
-    const action = !match.suddenDeathActive && criticalWidth > 0 && distance <= criticalWidth / 2
+    const bullseyeDistance = Math.abs(markerPosition - bullseyeCenter);
+    const action = !match.suddenDeathActive && criticalWidth > 0 && bullseyeDistance <= criticalWidth / 2
       ? "bullseye"
       : distance <= width / 2
         ? "hit"

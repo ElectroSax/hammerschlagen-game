@@ -10,6 +10,7 @@ const {
   applyHostNpcAction,
   applyNpcTurn,
   awardMatchToWinner,
+  rerollLuckyBullseye,
   claimNpcCharacter,
   createBackup,
   confirmTurn,
@@ -17,6 +18,7 @@ const {
   createRoom,
   publicState,
   restartCurrentMatch,
+  resetTournamentToLobby,
   restoreBackup,
   randomizeBracket,
   setPlayerStats,
@@ -275,6 +277,7 @@ test("bent nails and full-miss beer checks wait for explicit turn confirmation",
   assert.deepEqual(room.currentMatch.bonusIds, ["p1"]);
   const boosted = swingStats(room.players[0], false, true);
   assert.equal(boosted.width, 30);
+  assert.equal(boosted.luckyWidth, swingStats({ ...room.players[0], strength: 5 }).luckyWidth * 2);
   room.currentMatch.turnIndex = room.currentMatch.playerIds.indexOf("p1");
   room.currentMatch.bentIds = ["p1"];
   assert.equal(applyAction(room, "p1", "hit").ok, true);
@@ -560,17 +563,17 @@ test("NPCs automatically drink before each sudden-death swing", () => {
   assert.equal(match.pendingAdvance.playerId, "npc");
 });
 
-test("the bullseye stays five percent of the hit zone, including on a bent nail", () => {
+test("the bullseye stays one percent of the bar, including on a bent nail", () => {
   const room = roomWithPlayers(2);
   startNextMatch(room);
   const match = room.currentMatch;
   match.bentIds = ["p1"];
   const bentStats = swingStats(room.players[0], true);
-  assert.equal(bentStats.criticalWidth, bentStats.width * 0.05);
+  assert.equal(bentStats.criticalWidth, 1);
   assert.equal(applyAction(room, "p1", "bullseye").ok, true);
   assert.equal(match.scores.p1, 2);
   assert.deepEqual(match.bentIds, ["p1"]);
-  assert.equal(match.lastSwing.stats.criticalWidth, match.lastSwing.stats.width * 0.05);
+  assert.equal(match.lastSwing.stats.criticalWidth, 1);
 });
 
 test("a host-controlled NPC must drink before swinging in sudden death", () => {
@@ -739,11 +742,12 @@ test("NPCs can occasionally land a critical hit and score two hits", () => {
   startNextMatch(room);
   room.currentMatch.turnIndex = room.currentMatch.playerIds.indexOf("npc");
 
-  const result = applyNpcTurn(room, () => 0.04);
+  const result = applyNpcTurn(room, () => 0.009);
 
   assert.equal(result.outcome, "hit");
   assert.equal(room.currentMatch.lastSwing.action, "bullseye");
-  assert.ok(Math.abs(room.currentMatch.lastSwing.position - 50) <= room.currentMatch.lastSwing.stats.criticalWidth / 2);
+  assert.ok(Math.abs(room.currentMatch.lastSwing.position - room.currentMatch.lastSwing.bullseyeCenter) <=
+    room.currentMatch.lastSwing.stats.criticalWidth / 2);
   assert.equal(room.currentMatch.scores.npc, 2);
   assert.equal(room.currentMatch.hitEffect.kind, "bullseye");
   assert.equal(room.currentMatch.pendingAdvance.outcome, "bullseye");
@@ -752,6 +756,7 @@ test("NPCs can occasionally land a critical hit and score two hits", () => {
 test("a player can roll a 20 in the lucky zone for a Lucky Bullseye", () => {
   const room = roomWithPlayers(2);
   startNextMatch(room);
+  room.currentMatch.bullseyeOffset = 0;
 
   const result = applyAction(room, "p1", "hit", () => 0.999, 51.4);
 
@@ -765,9 +770,25 @@ test("a player can roll a 20 in the lucky zone for a Lucky Bullseye", () => {
   assert.equal(publicState(room).currentMatch.lastLuckyBullseye.roll, 20);
 });
 
+test("the bullseye moves randomly within the lucky zone and is scored at its displayed position", () => {
+  const room = roomWithPlayers(2);
+  startNextMatch(room);
+  room.currentMatch.bullseyeOffset = 1;
+  const stats = swingStats(room.players[0]);
+  const bullseyeCenter = 50 + stats.luckyWidth / 2;
+
+  const result = applyAction(room, "p1", "hit", () => 0.5, bullseyeCenter);
+
+  assert.equal(result.outcome, "bullseye");
+  assert.equal(room.currentMatch.lastSwing.bullseyeCenter, bullseyeCenter);
+  assert.equal(room.currentMatch.scores.p1, 2);
+  assert.equal(room.currentMatch.lastLuckyBullseye, null);
+});
+
 test("a failed lucky roll remains a regular hit for a human or NPC", () => {
   const humanRoom = roomWithPlayers(2);
   startNextMatch(humanRoom);
+  humanRoom.currentMatch.bullseyeOffset = 0;
   applyAction(humanRoom, "p1", "hit", () => 0.9, 51.4);
   assert.equal(humanRoom.currentMatch.lastLuckyBullseye.roll, 19);
   assert.equal(humanRoom.currentMatch.lastSwing.action, "hit");
@@ -781,11 +802,38 @@ test("a failed lucky roll remains a regular hit for a human or NPC", () => {
   seedTournament(npcRoom);
   startNextMatch(npcRoom);
   npcRoom.currentMatch.turnIndex = npcRoom.currentMatch.playerIds.indexOf("npc");
-  const rolls = [0.1, 0.9];
+  const rolls = [0.02, 0.9];
   applyNpcTurn(npcRoom, () => rolls.shift());
   assert.equal(npcRoom.currentMatch.lastLuckyBullseye.roll, 19);
   assert.equal(npcRoom.currentMatch.lastSwing.action, "hit");
   assert.equal(npcRoom.currentMatch.scores.npc, 1);
+});
+
+test("the host can reroll a lucky roll once and the result updates the pending score", () => {
+  const room = roomWithPlayers(2);
+  startNextMatch(room);
+  room.currentMatch.bullseyeOffset = 0;
+  room.currentMatch.hitsToWin = 5;
+  room.currentMatch.scores.p1 = 3;
+  room.currentMatch.scores.p2 = 3;
+
+  assert.equal(applyAction(room, "p1", "hit", () => 0.999, 51.4).ok, true);
+  assert.equal(room.currentMatch.scores.p1, 5);
+  assert.equal(room.currentMatch.gamePointId, "p1");
+
+  const reroll = rerollLuckyBullseye(room, () => 0);
+
+  assert.deepEqual(reroll, { ok: true, roll: 1, success: false });
+  assert.equal(room.currentMatch.scores.p1, 4);
+  assert.equal(room.currentMatch.lastSwing.action, "hit");
+  assert.equal(room.currentMatch.pendingAdvance.outcome, "hit");
+  assert.equal(room.currentMatch.gamePointId, null);
+  assert.deepEqual(rerollLuckyBullseye(room, () => 0.999), {
+    ok: false,
+    error: "There is no eligible lucky bullseye roll to reroll."
+  });
+  assert.equal(confirmTurn(room, "p1").ok, true);
+  assert.equal(room.currentMatch.gamePointId, null);
 });
 
 test("human and NPC turns alternate exactly once across confirmations", () => {
@@ -817,12 +865,16 @@ test("stats from zero to five widen the target, slow the meter, and govern NPC a
   const high = swingStats({ ...base, strength: 5, dexterity: 5 });
   assert.ok(high.width > low.width);
   assert.equal(high.width, 30);
-  assert.equal(high.criticalWidth, high.width * 0.05);
-  assert.equal(low.criticalWidth, low.width * 0.05);
-  assert.equal(high.luckyWidth, high.width * 0.1);
-  assert.equal(low.luckyWidth, low.width * 0.1);
+  assert.equal(high.criticalWidth, 1);
+  assert.equal(low.criticalWidth, 1);
+  assert.equal(high.luckyWidth, high.width * 0.12 + 1);
+  assert.equal(low.luckyWidth, low.width * 0.12 + 1);
+  assert.equal(
+    swingStats(base, false, true).luckyWidth,
+    swingStats({ ...base, strength: 5 }).luckyWidth * 2
+  );
   const bentHigh = swingStats({ ...base, strength: 5 }, true);
-  assert.equal(bentHigh.criticalWidth, bentHigh.width * 0.05);
+  assert.equal(bentHigh.criticalWidth, 1);
   assert.ok(high.speed < low.speed);
   const oldSpeedAtDexterityThree = 105 / (0.7 + 3 * 0.15) * 2.5;
   assert.equal(swingStats({ ...base, dexterity: 0 }).speed, oldSpeedAtDexterityThree);
@@ -998,7 +1050,7 @@ test("a bullseye is recorded as two hits and emits a gold effect", () => {
   assert.equal(room.currentMatch.lastSwing.position, 50);
   assert.equal(
     room.currentMatch.lastSwing.stats.criticalWidth,
-    room.currentMatch.lastSwing.stats.width * 0.05
+    1
   );
   assert.equal(room.currentMatch.pendingAdvance.playerId, "p1");
   assert.equal(room.currentMatch.hitEffect.kind, "bullseye");
@@ -1044,21 +1096,29 @@ test("restarting a match resets score, nail state, beers, and drunkenness", () =
   assert.equal(restartCurrentMatch({ phase: "tournament", currentMatch: null }), false);
 });
 
-test("tournament restart rebuilds the opening bracket and clears results while retaining configured stats", () => {
+test("tournament restart returns participants to the lobby with setup intact", () => {
   const room = roomWithPlayers(4);
   room.players[0].strength = 0;
+  room.firstRoundMatchups = [["p1", "p4"], ["p3", "p2"]];
   startNextMatch(room);
   assert.equal(winCurrentMatch(room).ok, true);
   assert.equal(room.history.length, 1);
+  room.players[0].beersDrank = 2;
+  room.players[0].drunk = 1;
 
-  seedTournament(room);
+  assert.equal(resetTournamentToLobby(room), true);
+  assert.equal(room.phase, "lobby");
   assert.equal(room.history.length, 0);
   assert.equal(room.roundNumber, 1);
   assert.equal(room.players[0].strength, 0);
   assert.deepEqual(room.roundByes, []);
-  assert.equal(publicState(room).roundLabel, "Winners Round 1");
-  assert.equal(startNextMatch(room), true);
-  assert.deepEqual(room.currentMatch.playerIds, ["p1", "p2"]);
+  assert.equal(room.roundLabel, null);
+  assert.equal(room.currentMatch, null);
+  assert.deepEqual(room.pendingMatches, []);
+  assert.deepEqual(room.firstRoundMatchups, [["p1", "p4"], ["p3", "p2"]]);
+  assert.deepEqual([room.players[0].wins, room.players[0].losses, room.players[0].beersDrank, room.players[0].drunk], [0, 0, 0, 0]);
+  assert.equal(publicState(room).phase, "lobby");
+  assert.equal(resetTournamentToLobby(room), false);
 });
 
 test("three players get byes through the double-elimination bracket and crown a champion", () => {

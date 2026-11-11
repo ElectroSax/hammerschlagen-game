@@ -23,8 +23,10 @@ const {
   prepareNextMatch,
   publicState,
   randomizeBracket,
+  rerollLuckyBullseye,
   resolveCurrentMatch,
   restartCurrentMatch,
+  resetTournamentToLobby,
   restoreBackup,
   setMatchBestOf,
   setMatchHitsToWin,
@@ -393,7 +395,13 @@ io.on("connection", (socket) => {
         callback?.({ ok: false, error: "Each NPC line must have a name and Strength, Dexterity, and Constitution from 0 to 5; Wisdom is optional and must be from 0 to 5." });
         return;
       }
-      normalizedEntries.push({ name, stats });
+      normalizedEntries.push({
+        name,
+        stats,
+        characterImage: typeof entry.characterImage === "string" && characterImages.includes(entry.characterImage)
+          ? entry.characterImage
+          : defaultCharacterImage
+      });
     }
     const names = normalizedEntries.map((entry) => entry.name.toLowerCase());
     if (new Set(names).size !== names.length ||
@@ -402,9 +410,10 @@ io.on("connection", (socket) => {
       return;
     }
 
-    normalizedEntries.forEach(({ name, stats }) => {
+    normalizedEntries.forEach(({ name, stats, characterImage }) => {
       const npc = createPlayer(`npc-${randomUUID()}`, name, true);
       setPlayerStats(npc, stats);
+      npc.characterImage = characterImage;
       room.players.push(npc);
     });
     room.firstRoundMatchups = null;
@@ -803,6 +812,37 @@ io.on("connection", (socket) => {
     broadcast(room);
   });
 
+  socket.on("host:coin-flip-match", ({ code } = {}, callback) => {
+    const room = rooms.get(typeof code === "string" ? code : "");
+    if (!hostOnly(socket, room) || room.phase !== "tournament" || !room.currentMatch) {
+      callback?.({ ok: false, error: "There is no active match to award." });
+      return;
+    }
+    const coin = randomInt(0, 2);
+    const winnerId = room.currentMatch.playerIds[coin];
+    clearNpcTimer(room);
+    room.npcStepRequired = false;
+    room.npcStepInProgress = false;
+    room.npcManualTurnId = null;
+    if (!awardMatchToWinner(room, winnerId)) {
+      callback?.({ ok: false, error: "Could not award the match to the selected participant." });
+      return;
+    }
+    callback?.({ ok: true, winnerId, coin: coin === 0 ? "Heads" : "Tails" });
+    broadcast(room);
+  });
+
+  socket.on("host:lucky-reroll", ({ code } = {}, callback) => {
+    const room = rooms.get(typeof code === "string" ? code : "");
+    if (!hostOnly(socket, room) || room.phase !== "tournament") {
+      callback?.({ ok: false, error: "Only the host can reroll a lucky bullseye." });
+      return;
+    }
+    const result = rerollLuckyBullseye(room);
+    callback?.(result);
+    if (result.ok) broadcast(room);
+  });
+
   socket.on("host:next-npc-turn", ({ code } = {}, callback) => {
     const room = rooms.get(typeof code === "string" ? code : "");
     const activeId = room?.currentMatch?.playerIds[room.currentMatch.turnIndex];
@@ -892,17 +932,13 @@ io.on("connection", (socket) => {
 
   socket.on("host:restart-tournament", ({ code } = {}, callback) => {
     const room = rooms.get(typeof code === "string" ? code : "");
-    if (!hostOnly(socket, room) || room.phase === "lobby") {
+    if (!hostOnly(socket, room) || !resetTournamentToLobby(room)) {
       callback?.({ ok: false, error: "Only the host can restart a started tournament." });
       return;
     }
     clearNpcTimer(room);
-    room.npcManualTurnId = null;
-    seedTournament(room);
-    startPlayableMatch(room);
     callback?.({ ok: true });
     broadcast(room);
-    scheduleNpcTurn(room);
   });
 
   socket.on("game:action", ({ code, action, position } = {}, callback) => {
